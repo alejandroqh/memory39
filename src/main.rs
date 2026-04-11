@@ -23,6 +23,10 @@ struct Cli {
     #[arg(long, default_value = "deepseek")]
     llm: String,
 
+    /// Override default model for the LLM provider
+    #[arg(long)]
+    model: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -244,11 +248,14 @@ async fn main() {
 
     match cli.command {
         Command::Ingest { input, user_id: _, timestamp: _ } => {
-            let config = llm::LlmConfig::preset(&cli.llm)
+            let mut config = llm::LlmConfig::preset(&cli.llm)
                 .unwrap_or_else(|| {
                     eprintln!("Unknown LLM provider: {}. Use: deepseek, groq, openai, ollama", cli.llm);
                     std::process::exit(1);
                 });
+            if let Some(m) = &cli.model {
+                config.model = m.clone();
+            }
 
             let text = if input == "-" {
                 use std::io::Read;
@@ -261,7 +268,6 @@ async fn main() {
 
             eprintln!("Memory agent via {} ({})...", cli.llm, config.model);
 
-            // The recall callback: LLM calls this to check existing memories
             let recall_fn = |query: &str| -> String {
                 let filters = db::RecallFilters {
                     min_importance: None,
