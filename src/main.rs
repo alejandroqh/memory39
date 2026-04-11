@@ -1,4 +1,5 @@
 mod db;
+mod llm;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -14,12 +15,31 @@ struct Cli {
     #[arg(long, default_value = "memory39.db")]
     db: PathBuf,
 
+    /// Use in-memory database (for benchmarks/testing, not persistent)
+    #[arg(long)]
+    ram: bool,
+
+    /// LLM provider: deepseek, groq, openai, ollama (for ingest command)
+    #[arg(long, default_value = "deepseek")]
+    llm: String,
+
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Ingest a conversation: LLM extracts key facts and stores them
+    Ingest {
+        /// Conversation text (or - for stdin)
+        input: String,
+        /// Optional user/namespace for isolation
+        #[arg(long)]
+        user_id: Option<String>,
+        /// Optional timestamp (YYYY-MM-DD)
+        #[arg(long)]
+        timestamp: Option<String>,
+    },
     /// Remember an event (something that happened)
     Event {
         /// What happened (max 255 chars)
@@ -212,11 +232,123 @@ enum Command {
     },
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
+    llm::load_dotenv();
     let cli = Cli::parse();
-    let conn = db::open(&cli.db).expect("failed to open database");
+    let conn = if cli.ram {
+        db::open_ram().expect("failed to open in-memory database")
+    } else {
+        db::open(&cli.db).expect("failed to open database")
+    };
 
     match cli.command {
+        Command::Ingest { input, user_id: _, timestamp: _ } => {
+            let config = llm::LlmConfig::preset(&cli.llm)
+                .unwrap_or_else(|| {
+                    eprintln!("Unknown LLM provider: {}. Use: deepseek, groq, openai, ollama", cli.llm);
+                    std::process::exit(1);
+                });
+
+            let text = if input == "-" {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf).expect("failed to read stdin");
+                buf
+            } else {
+                input
+            };
+
+            eprintln!("Memory agent via {} ({})...", cli.llm, config.model);
+
+            // The recall callback: LLM calls this to check existing memories
+            let recall_fn = |query: &str| -> String {
+                let filters = db::RecallFilters {
+                    min_importance: None,
+                    date_from: None,
+                    date_to: None,
+                    memory_type: None,
+                };
+                let results = db::recall(&conn, query, 5, &filters);
+                if results.is_empty() {
+                    "No existing memories found.".into()
+                } else {
+                    let mut out = String::new();
+                    for r in &results {
+                        out.push_str(&format!("[{}] {} (score: {:.2})\n", r.mid, r.memory_type, r.score));
+                        for (k, v) in &r.fields {
+                            out.push_str(&format!("  {}: {}\n", k, v));
+                        }
+                    }
+                    out
+                }
+            };
+
+            let actions = match llm::ingest_conversation(&config, &text, &recall_fn).await {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("Failed: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let created_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+            let mut stored = 0;
+            let mut updated = 0;
+            let mut forgotten = 0;
+
+            for action in &actions {
+                match action {
+                    llm::MemoryAction::Recall { query } => {
+                        eprintln!("  recall: {}", query);
+                    }
+                    llm::MemoryAction::Event { event, date, time, note, tags, importance, emotion, location, people, source } => {
+                        let datetime = date.as_ref().map(|d| {
+                            let t = time.as_deref().unwrap_or("00:00");
+                            format!("{} {}", d, t)
+                        });
+                        let id = db::insert_event(&conn, event, datetime.as_deref(), note.as_deref(), tags.as_deref(), *importance, emotion.as_deref(), location.as_deref(), people.as_deref(), source.as_deref(), &created_at).expect("failed to store");
+                        let mid = if datetime.is_some() { format!("E{}", id) } else { format!("U{}", id) };
+                        println!("[{}] event: {}", mid, event);
+                        stored += 1;
+                    }
+                    llm::MemoryAction::Thing { thing, desc, category, tags, importance, emotion, source, confidence, related } => {
+                        let id = db::insert_thing(&conn, thing, desc.as_deref(), category.as_deref(), tags.as_deref(), *importance, emotion.as_deref(), source.as_deref(), *confidence, related.as_deref(), &created_at).expect("failed to store");
+                        let mid = format!("T{}", id);
+                        println!("[{}] thing: {}", mid, thing);
+                        stored += 1;
+                    }
+                    llm::MemoryAction::Person { name, role, relationship, note, tags, importance, emotion } => {
+                        let id = db::insert_person(&conn, name, role.as_deref(), relationship.as_deref(), None, None, None, note.as_deref(), tags.as_deref(), *importance, emotion.as_deref(), &created_at).expect("failed to store");
+                        let mid = format!("P{}", id);
+                        println!("[{}] person: {}", mid, name);
+                        stored += 1;
+                    }
+                    llm::MemoryAction::Place { name, desc, address, kind, note, tags, importance, emotion } => {
+                        let id = db::insert_place(&conn, name, desc.as_deref(), address.as_deref(), kind.as_deref(), note.as_deref(), tags.as_deref(), *importance, emotion.as_deref(), &created_at).expect("failed to store");
+                        let mid = format!("L{}", id);
+                        println!("[{}] place: {}", mid, name);
+                        stored += 1;
+                    }
+                    llm::MemoryAction::Alter { id, fields } => {
+                        match db::alter(&conn, id, fields) {
+                            Ok(true) => { println!("[{}] altered", id); updated += 1; }
+                            Ok(false) => eprintln!("  alter {}: not found", id),
+                            Err(e) => eprintln!("  alter {}: {}", id, e),
+                        }
+                    }
+                    llm::MemoryAction::Forget { id } => {
+                        match db::forget(&conn, id) {
+                            Ok(true) => { println!("[{}] forgotten", id); forgotten += 1; }
+                            Ok(false) => eprintln!("  forget {}: not found", id),
+                            Err(e) => eprintln!("  forget {}: {}", id, e),
+                        }
+                    }
+                }
+            }
+
+            println!("\nDone: {} stored, {} updated, {} forgotten", stored, updated, forgotten);
+        }
         Command::Event {
             event,
             date,
@@ -377,110 +509,46 @@ fn main() {
             }
             println!("Found {} connections in {}ms", result.connections.len(), elapsed);
         }
-        Command::Thing {
-            thing,
-            desc,
-            category,
-            tags,
-            importance,
-            emotion,
-            source,
-            confidence,
-            related,
-        } => {
-            println!("Thing remembered:");
+        Command::Thing { thing, desc, category, tags, importance, emotion, source, confidence, related } => {
+            let created_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+            let id = db::insert_thing(&conn, &thing, desc.as_deref(), category.as_deref(), tags.as_deref(), importance, emotion.as_deref(), source.as_deref(), confidence, related.as_deref(), &created_at).expect("failed to store thing");
+            println!("Thing remembered [T{}]:", id);
             println!("  What:       {}", thing);
-            if let Some(v) = &desc {
-                println!("  Desc:       {}", v);
-            }
-            if let Some(v) = &category {
-                println!("  Category:   {}", v);
-            }
-            if let Some(v) = &emotion {
-                println!("  Emotion:    {}", v);
-            }
-            if let Some(v) = &source {
-                println!("  Source:      {}", v);
-            }
-            if let Some(v) = &related {
-                println!("  Related:    {}", v);
-            }
-            if let Some(v) = &tags {
-                println!("  Tags:       {}", v);
-            }
+            if let Some(v) = &desc { println!("  Desc:       {}", v); }
+            if let Some(v) = &category { println!("  Category:   {}", v); }
+            if let Some(v) = &emotion { println!("  Emotion:    {}", v); }
+            if let Some(v) = &source { println!("  Source:      {}", v); }
+            if let Some(v) = &related { println!("  Related:    {}", v); }
+            if let Some(v) = &tags { println!("  Tags:       {}", v); }
             println!("  Confidence: {}", confidence);
             println!("  Importance: {}", importance);
         }
-        Command::Person {
-            name,
-            role,
-            relationship,
-            contact,
-            met_at,
-            last_seen,
-            note,
-            tags,
-            emotion,
-            importance,
-        } => {
-            println!("Person remembered:");
+        Command::Person { name, role, relationship, contact, met_at, last_seen, note, tags, emotion, importance } => {
+            let created_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+            let id = db::insert_person(&conn, &name, role.as_deref(), relationship.as_deref(), contact.as_deref(), met_at.as_deref(), last_seen.as_deref(), note.as_deref(), tags.as_deref(), importance, emotion.as_deref(), &created_at).expect("failed to store person");
+            println!("Person remembered [P{}]:", id);
             println!("  Name:       {}", name);
-            if let Some(v) = &role {
-                println!("  Role:       {}", v);
-            }
-            if let Some(v) = &relationship {
-                println!("  Relation:   {}", v);
-            }
-            if let Some(v) = &contact {
-                println!("  Contact:    {}", v);
-            }
-            if let Some(v) = &met_at {
-                println!("  Met at:     {}", v);
-            }
-            if let Some(v) = &last_seen {
-                println!("  Last seen:  {}", v);
-            }
-            if let Some(v) = &note {
-                println!("  Note:       {}", v);
-            }
-            if let Some(v) = &emotion {
-                println!("  Emotion:    {}", v);
-            }
-            if let Some(v) = &tags {
-                println!("  Tags:       {}", v);
-            }
+            if let Some(v) = &role { println!("  Role:       {}", v); }
+            if let Some(v) = &relationship { println!("  Relation:   {}", v); }
+            if let Some(v) = &contact { println!("  Contact:    {}", v); }
+            if let Some(v) = &met_at { println!("  Met at:     {}", v); }
+            if let Some(v) = &last_seen { println!("  Last seen:  {}", v); }
+            if let Some(v) = &note { println!("  Note:       {}", v); }
+            if let Some(v) = &emotion { println!("  Emotion:    {}", v); }
+            if let Some(v) = &tags { println!("  Tags:       {}", v); }
             println!("  Importance: {}", importance);
         }
-        Command::Place {
-            name,
-            desc,
-            address,
-            kind,
-            note,
-            tags,
-            emotion,
-            importance,
-        } => {
-            println!("Place remembered:");
+        Command::Place { name, desc, address, kind, note, tags, emotion, importance } => {
+            let created_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+            let id = db::insert_place(&conn, &name, desc.as_deref(), address.as_deref(), kind.as_deref(), note.as_deref(), tags.as_deref(), importance, emotion.as_deref(), &created_at).expect("failed to store place");
+            println!("Place remembered [L{}]:", id);
             println!("  Name:       {}", name);
-            if let Some(v) = &desc {
-                println!("  Desc:       {}", v);
-            }
-            if let Some(v) = &address {
-                println!("  Address:    {}", v);
-            }
-            if let Some(v) = &kind {
-                println!("  Kind:       {}", v);
-            }
-            if let Some(v) = &note {
-                println!("  Note:       {}", v);
-            }
-            if let Some(v) = &emotion {
-                println!("  Emotion:    {}", v);
-            }
-            if let Some(v) = &tags {
-                println!("  Tags:       {}", v);
-            }
+            if let Some(v) = &desc { println!("  Desc:       {}", v); }
+            if let Some(v) = &address { println!("  Address:    {}", v); }
+            if let Some(v) = &kind { println!("  Kind:       {}", v); }
+            if let Some(v) = &note { println!("  Note:       {}", v); }
+            if let Some(v) = &emotion { println!("  Emotion:    {}", v); }
+            if let Some(v) = &tags { println!("  Tags:       {}", v); }
             println!("  Importance: {}", importance);
         }
     }

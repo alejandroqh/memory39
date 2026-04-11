@@ -19,6 +19,17 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+pub fn open_ram() -> Result<Connection> {
+    let conn = Connection::open_in_memory()?;
+    conn.execute_batch("
+        PRAGMA synchronous = OFF;
+        PRAGMA cache_size = -16000;
+        PRAGMA temp_store = MEMORY;
+    ")?;
+    conn.execute_batch(SCHEMA)?;
+    Ok(conn)
+}
+
 const SCHEMA: &str = "
 -- Dated events (past and future)
 CREATE TABLE IF NOT EXISTS events (
@@ -102,6 +113,120 @@ CREATE TRIGGER IF NOT EXISTS events_undated_au AFTER UPDATE ON events_undated BE
     INSERT INTO events_undated_fts(rowid, event, note, tags, emotion, location, people)
     VALUES (new.id, new.event, new.note, new.tags, new.emotion, new.location, new.people);
 END;
+
+-- Things (objects, concepts, items worth remembering)
+CREATE TABLE IF NOT EXISTS things (
+    id         INTEGER PRIMARY KEY,
+    thing      TEXT NOT NULL,
+    desc       TEXT,
+    category   TEXT,
+    tags       TEXT,
+    importance INTEGER NOT NULL DEFAULT 5,
+    emotion    TEXT,
+    source     TEXT,
+    confidence INTEGER NOT NULL DEFAULT 7,
+    related    TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_things_importance ON things(importance DESC);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS things_fts USING fts5(
+    thing, desc, category, tags, emotion, related,
+    content=things,
+    content_rowid=id
+);
+
+CREATE TRIGGER IF NOT EXISTS things_ai AFTER INSERT ON things BEGIN
+    INSERT INTO things_fts(rowid, thing, desc, category, tags, emotion, related)
+    VALUES (new.id, new.thing, new.desc, new.category, new.tags, new.emotion, new.related);
+END;
+CREATE TRIGGER IF NOT EXISTS things_ad AFTER DELETE ON things BEGIN
+    INSERT INTO things_fts(things_fts, rowid, thing, desc, category, tags, emotion, related)
+    VALUES ('delete', old.id, old.thing, old.desc, old.category, old.tags, old.emotion, old.related);
+END;
+CREATE TRIGGER IF NOT EXISTS things_au AFTER UPDATE ON things BEGIN
+    INSERT INTO things_fts(things_fts, rowid, thing, desc, category, tags, emotion, related)
+    VALUES ('delete', old.id, old.thing, old.desc, old.category, old.tags, old.emotion, old.related);
+    INSERT INTO things_fts(rowid, thing, desc, category, tags, emotion, related)
+    VALUES (new.id, new.thing, new.desc, new.category, new.tags, new.emotion, new.related);
+END;
+
+-- Persons (people worth remembering)
+CREATE TABLE IF NOT EXISTS persons (
+    id           INTEGER PRIMARY KEY,
+    name         TEXT NOT NULL,
+    role         TEXT,
+    relationship TEXT,
+    contact      TEXT,
+    met_at       TEXT,
+    last_seen    TEXT,
+    note         TEXT,
+    tags         TEXT,
+    importance   INTEGER NOT NULL DEFAULT 5,
+    emotion      TEXT,
+    created_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_persons_importance ON persons(importance DESC);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS persons_fts USING fts5(
+    name, role, relationship, note, tags, emotion,
+    content=persons,
+    content_rowid=id
+);
+
+CREATE TRIGGER IF NOT EXISTS persons_ai AFTER INSERT ON persons BEGIN
+    INSERT INTO persons_fts(rowid, name, role, relationship, note, tags, emotion)
+    VALUES (new.id, new.name, new.role, new.relationship, new.note, new.tags, new.emotion);
+END;
+CREATE TRIGGER IF NOT EXISTS persons_ad AFTER DELETE ON persons BEGIN
+    INSERT INTO persons_fts(persons_fts, rowid, name, role, relationship, note, tags, emotion)
+    VALUES ('delete', old.id, old.name, old.role, old.relationship, old.note, old.tags, old.emotion);
+END;
+CREATE TRIGGER IF NOT EXISTS persons_au AFTER UPDATE ON persons BEGIN
+    INSERT INTO persons_fts(persons_fts, rowid, name, role, relationship, note, tags, emotion)
+    VALUES ('delete', old.id, old.name, old.role, old.relationship, old.note, old.tags, old.emotion);
+    INSERT INTO persons_fts(rowid, name, role, relationship, note, tags, emotion)
+    VALUES (new.id, new.name, new.role, new.relationship, new.note, new.tags, new.emotion);
+END;
+
+-- Places (locations worth remembering)
+CREATE TABLE IF NOT EXISTS places (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL,
+    desc       TEXT,
+    address    TEXT,
+    kind       TEXT,
+    note       TEXT,
+    tags       TEXT,
+    importance INTEGER NOT NULL DEFAULT 5,
+    emotion    TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_places_importance ON places(importance DESC);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS places_fts USING fts5(
+    name, desc, address, kind, note, tags, emotion,
+    content=places,
+    content_rowid=id
+);
+
+CREATE TRIGGER IF NOT EXISTS places_ai AFTER INSERT ON places BEGIN
+    INSERT INTO places_fts(rowid, name, desc, address, kind, note, tags, emotion)
+    VALUES (new.id, new.name, new.desc, new.address, new.kind, new.note, new.tags, new.emotion);
+END;
+CREATE TRIGGER IF NOT EXISTS places_ad AFTER DELETE ON places BEGIN
+    INSERT INTO places_fts(places_fts, rowid, name, desc, address, kind, note, tags, emotion)
+    VALUES ('delete', old.id, old.name, old.desc, old.address, old.kind, old.note, old.tags, old.emotion);
+END;
+CREATE TRIGGER IF NOT EXISTS places_au AFTER UPDATE ON places BEGIN
+    INSERT INTO places_fts(places_fts, rowid, name, desc, address, kind, note, tags, emotion)
+    VALUES ('delete', old.id, old.name, old.desc, old.address, old.kind, old.note, old.tags, old.emotion);
+    INSERT INTO places_fts(rowid, name, desc, address, kind, note, tags, emotion)
+    VALUES (new.id, new.name, new.desc, new.address, new.kind, new.note, new.tags, new.emotion);
+END;
 ";
 
 pub fn insert_event(
@@ -135,6 +260,69 @@ pub fn insert_event(
             Ok(conn.last_insert_rowid())
         }
     }
+}
+
+pub fn insert_thing(
+    conn: &Connection,
+    thing: &str,
+    desc: Option<&str>,
+    category: Option<&str>,
+    tags: Option<&str>,
+    importance: u8,
+    emotion: Option<&str>,
+    source: Option<&str>,
+    confidence: u8,
+    related: Option<&str>,
+    created_at: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO things (thing, desc, category, tags, importance, emotion, source, confidence, related, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![thing, desc, category, tags, importance, emotion, source, confidence, related, created_at],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn insert_person(
+    conn: &Connection,
+    name: &str,
+    role: Option<&str>,
+    relationship: Option<&str>,
+    contact: Option<&str>,
+    met_at: Option<&str>,
+    last_seen: Option<&str>,
+    note: Option<&str>,
+    tags: Option<&str>,
+    importance: u8,
+    emotion: Option<&str>,
+    created_at: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO persons (name, role, relationship, contact, met_at, last_seen, note, tags, importance, emotion, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![name, role, relationship, contact, met_at, last_seen, note, tags, importance, emotion, created_at],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn insert_place(
+    conn: &Connection,
+    name: &str,
+    desc: Option<&str>,
+    address: Option<&str>,
+    kind: Option<&str>,
+    note: Option<&str>,
+    tags: Option<&str>,
+    importance: u8,
+    emotion: Option<&str>,
+    created_at: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO places (name, desc, address, kind, note, tags, importance, emotion, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![name, desc, address, kind, note, tags, importance, emotion, created_at],
+    )?;
+    Ok(conn.last_insert_rowid())
 }
 
 /// Memory ID prefix: E = events, U = events_undated, T = things, P = persons, L = places
@@ -231,6 +419,85 @@ pub fn recall(conn: &Connection, query: &str, limit: usize, filters: &RecallFilt
         recall_fts(conn, &mut results, limit, &sql, query, false, &extra_params, &now);
     }
 
+    let skip_things = filters.memory_type.as_ref().is_some_and(|t| t != "thing");
+    let skip_persons = filters.memory_type.as_ref().is_some_and(|t| t != "person");
+    let skip_places = filters.memory_type.as_ref().is_some_and(|t| t != "place");
+
+    // Search things
+    if !skip_things {
+        let mut where_extra = String::new();
+        let mut extra_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(min) = filters.min_importance {
+            where_extra.push_str(" AND t.importance >= ?3");
+            extra_params.push(Box::new(min));
+        }
+
+        let sql = format!(
+            "SELECT t.id, rank, t.thing, t.desc, t.category, t.tags, t.importance,
+                    t.emotion, t.source, t.confidence, t.related, t.created_at
+             FROM things_fts f
+             JOIN things t ON t.id = f.rowid
+             WHERE things_fts MATCH ?1{}
+             LIMIT ?2",
+            where_extra
+        );
+
+        recall_generic(conn, &mut results, limit, &sql, query, &extra_params, &now,
+            "thing", "T", &["Thing", "Description", "Category", "Tags", "Importance",
+                            "Emotion", "Source", "Confidence", "Related"]);
+    }
+
+    // Search persons
+    if !skip_persons {
+        let mut where_extra = String::new();
+        let mut extra_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(min) = filters.min_importance {
+            where_extra.push_str(" AND p.importance >= ?3");
+            extra_params.push(Box::new(min));
+        }
+
+        let sql = format!(
+            "SELECT p.id, rank, p.name, p.role, p.relationship, p.contact, p.met_at,
+                    p.last_seen, p.note, p.tags, p.importance, p.emotion, p.created_at
+             FROM persons_fts f
+             JOIN persons p ON p.id = f.rowid
+             WHERE persons_fts MATCH ?1{}
+             LIMIT ?2",
+            where_extra
+        );
+
+        recall_generic(conn, &mut results, limit, &sql, query, &extra_params, &now,
+            "person", "P", &["Name", "Role", "Relationship", "Contact", "Met at",
+                             "Last seen", "Note", "Tags", "Importance", "Emotion"]);
+    }
+
+    // Search places
+    if !skip_places {
+        let mut where_extra = String::new();
+        let mut extra_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(min) = filters.min_importance {
+            where_extra.push_str(" AND l.importance >= ?3");
+            extra_params.push(Box::new(min));
+        }
+
+        let sql = format!(
+            "SELECT l.id, rank, l.name, l.desc, l.address, l.kind, l.note, l.tags,
+                    l.importance, l.emotion, l.created_at
+             FROM places_fts f
+             JOIN places l ON l.id = f.rowid
+             WHERE places_fts MATCH ?1{}
+             LIMIT ?2",
+            where_extra
+        );
+
+        recall_generic(conn, &mut results, limit, &sql, query, &extra_params, &now,
+            "place", "L", &["Name", "Description", "Address", "Kind", "Note", "Tags",
+                            "Importance", "Emotion"]);
+    }
+
     // Sort by composite score descending
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     results.truncate(limit);
@@ -264,6 +531,76 @@ fn recall_fts(
 
     match stmt.query_map(param_refs.as_slice(), |row| {
         Ok(build_event_result(row, dated, now))
+    }) {
+        Ok(rows) => {
+            for r in rows.flatten() {
+                results.push(r);
+            }
+        }
+        Err(e) => eprintln!("search error: {}", e),
+    }
+}
+
+/// Generic recall for non-event tables (things, persons, places).
+/// `labels` maps to SELECT columns starting at index 2 (after id and rank).
+/// The label named "Importance" or "Confidence" is parsed as i64; all others as String.
+fn recall_generic(
+    conn: &Connection,
+    results: &mut Vec<RecallResult>,
+    limit: usize,
+    sql: &str,
+    query: &str,
+    extra_params: &[Box<dyn rusqlite::types::ToSql>],
+    now: &str,
+    memory_type: &str,
+    prefix: &str,
+    labels: &[&str],
+) {
+    let mut stmt = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("query error: {}", e); return; }
+    };
+
+    let mut param_refs: Vec<&dyn rusqlite::types::ToSql> = Vec::new();
+    let query_str = query.to_string();
+    let limit_val = limit as i64;
+    param_refs.push(&query_str);
+    param_refs.push(&limit_val);
+    for p in extra_params {
+        param_refs.push(p.as_ref());
+    }
+
+    let mem_type = memory_type.to_string();
+    let pfx = prefix.to_string();
+    let labels_owned: Vec<String> = labels.iter().map(|s| s.to_string()).collect();
+
+    match stmt.query_map(param_refs.as_slice(), |row| {
+        let id: i64 = row.get(0).unwrap_or(0);
+        let fts_rank: f64 = row.get(1).unwrap_or(0.0);
+        let mut fields = Vec::new();
+        let mut importance: i64 = 5;
+
+        for (i, label) in labels_owned.iter().enumerate() {
+            let col = 2 + i;
+            if label == "Importance" || label == "Confidence" {
+                if let Ok(v) = row.get::<_, i64>(col) {
+                    if label == "Importance" { importance = v; }
+                    fields.push((label.clone(), v.to_string()));
+                }
+            } else if let Ok(v) = row.get::<_, String>(col) {
+                if !v.is_empty() {
+                    fields.push((label.clone(), v));
+                }
+            }
+        }
+
+        let score = composite_score(fts_rank, importance, None, now);
+        Ok(RecallResult {
+            memory_type: mem_type.clone(),
+            mid: memory_id(&pfx, id),
+            score,
+            fields,
+        })
     }) {
         Ok(rows) => {
             for r in rows.flatten() {
@@ -367,6 +704,9 @@ pub fn forget(conn: &Connection, mid: &str) -> Result<bool> {
     let deleted = match prefix.as_str() {
         "E" => conn.execute("DELETE FROM events WHERE id = ?1", [row_id])?,
         "U" => conn.execute("DELETE FROM events_undated WHERE id = ?1", [row_id])?,
+        "T" => conn.execute("DELETE FROM things WHERE id = ?1", [row_id])?,
+        "P" => conn.execute("DELETE FROM persons WHERE id = ?1", [row_id])?,
+        "L" => conn.execute("DELETE FROM places WHERE id = ?1", [row_id])?,
         _ => return Err(rusqlite::Error::InvalidParameterName(format!("unknown prefix: {}", prefix))),
     };
     Ok(deleted > 0)
@@ -383,6 +723,9 @@ pub fn alter(conn: &Connection, mid: &str, changes: &[(String, String)]) -> Resu
     let table = match prefix.as_str() {
         "E" => "events",
         "U" => "events_undated",
+        "T" => "things",
+        "P" => "persons",
+        "L" => "places",
         _ => return Err(rusqlite::Error::InvalidParameterName(format!("unknown prefix: {}", prefix))),
     };
 
@@ -394,7 +737,26 @@ pub fn alter(conn: &Connection, mid: &str, changes: &[(String, String)]) -> Resu
         "event", "note", "tags", "importance",
         "emotion", "location", "people", "source",
     ];
-    let valid = if prefix == "E" { &valid_fields_dated[..] } else { &valid_fields_undated[..] };
+    let valid_fields_things = [
+        "thing", "desc", "category", "tags", "importance",
+        "emotion", "source", "confidence", "related",
+    ];
+    let valid_fields_persons = [
+        "name", "role", "relationship", "contact", "met_at",
+        "last_seen", "note", "tags", "importance", "emotion",
+    ];
+    let valid_fields_places = [
+        "name", "desc", "address", "kind", "note",
+        "tags", "importance", "emotion",
+    ];
+    let valid = match prefix.as_str() {
+        "E" => &valid_fields_dated[..],
+        "U" => &valid_fields_undated[..],
+        "T" => &valid_fields_things[..],
+        "P" => &valid_fields_persons[..],
+        "L" => &valid_fields_places[..],
+        _ => unreachable!(),
+    };
 
     let mut set_clauses = Vec::new();
     let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -403,7 +765,7 @@ pub fn alter(conn: &Connection, mid: &str, changes: &[(String, String)]) -> Resu
         if !valid.contains(&field.as_str()) {
             return Err(rusqlite::Error::InvalidParameterName(format!("invalid field: {}", field)));
         }
-        set_clauses.push(format!("{} = ?", field));
+        set_clauses.push(format!("`{}` = ?", field));
         values.push(Box::new(value.clone()));
     }
     values.push(Box::new(row_id));
@@ -505,6 +867,7 @@ fn phase_direct(
     connections: &mut Vec<Connection_>,
     seen: &mut HashSet<String>,
 ) {
+    // Event tables (dated and undated)
     for (table, fts, prefix, dated) in &[
         ("events", "events_fts", "E", true),
         ("events_undated", "events_undated_fts", "U", false),
@@ -553,6 +916,62 @@ fn phase_direct(
             };
             fields.push(("Importance".into(), imp.to_string()));
 
+            Ok(DirectHit {
+                mid: memory_id(prefix, id),
+                importance: imp,
+                fields,
+            })
+        }) {
+            Ok(rows) => rows.flatten().collect(),
+            Err(e) => { eprintln!("phase_direct search: {}", e); continue; }
+        };
+
+        for hit in hits {
+            if seen.contains(&hit.mid) { continue; }
+            seen.insert(hit.mid.clone());
+            let score = (hit.importance as f64 / 10.0).max(0.5);
+            connections.push(Connection_ {
+                kind: ConnectionKind::Direct { mid: hit.mid },
+                score,
+                fields: hit.fields,
+            });
+        }
+    }
+
+    // Non-event tables: things, persons, places
+    // Each has: id, primary_label, importance (columns 0, 1, 2)
+    for (table, fts, prefix, label_col, label_name) in &[
+        ("things", "things_fts", "T", "thing", "Thing"),
+        ("persons", "persons_fts", "P", "name", "Name"),
+        ("places", "places_fts", "L", "name", "Name"),
+    ] {
+        let min_clause = if min_importance.is_some() {
+            format!(" AND t.importance >= {}", min_importance.unwrap())
+        } else {
+            String::new()
+        };
+
+        let sql = format!(
+            "SELECT t.id, t.{}, t.importance
+             FROM {} f JOIN {} t ON t.id = f.rowid
+             WHERE {} MATCH ?1{}
+             LIMIT 20",
+            label_col, fts, table, fts, min_clause
+        );
+
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) => { eprintln!("phase_direct error: {}", e); continue; }
+        };
+
+        let hits: Vec<DirectHit> = match stmt.query_map([and_query], |row| {
+            let id: i64 = row.get(0)?;
+            let name: String = row.get(1)?;
+            let imp: i64 = row.get(2).unwrap_or(5);
+            let fields = vec![
+                (label_name.to_string(), name),
+                ("Importance".into(), imp.to_string()),
+            ];
             Ok(DirectHit {
                 mid: memory_id(prefix, id),
                 importance: imp,
@@ -650,6 +1069,62 @@ fn search_mem_rows(
 
         rows.extend(hits);
     }
+
+    // Non-event tables: things, persons, places
+    // Each gets: id, importance, tags, emotion
+    for (table, fts, prefix, linkable_fields) in &[
+        ("things", "things_fts", "T", &["tags", "emotion"][..]),
+        ("persons", "persons_fts", "P", &["tags", "emotion"][..]),
+        ("places", "places_fts", "L", &["tags", "emotion"][..]),
+    ] {
+        let min_clause = if min_importance.is_some() {
+            format!(" AND t.importance >= {}", min_importance.unwrap())
+        } else {
+            String::new()
+        };
+
+        // Build SELECT with linkable fields
+        let extra_cols = linkable_fields.iter()
+            .map(|f| format!("t.{}", f))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            "SELECT t.id, t.importance, {}
+             FROM {} f JOIN {} t ON t.id = f.rowid
+             WHERE {} MATCH ?1{}
+             LIMIT 50",
+            extra_cols, fts, table, fts, min_clause
+        );
+
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let lf: Vec<String> = linkable_fields.iter().map(|s| s.to_string()).collect();
+
+        let hits: Vec<MemRow> = match stmt.query_map([fts_query], |row| {
+            let id: i64 = row.get(0)?;
+            let mid = memory_id(prefix, id);
+            let mut field_map = HashMap::new();
+
+            let imp: i64 = row.get(1).unwrap_or(5);
+            for (i, name) in lf.iter().enumerate() {
+                if let Ok(v) = row.get::<_, String>(2 + i) {
+                    if !v.is_empty() { field_map.insert(name.clone(), v); }
+                }
+            }
+
+            Ok(MemRow { mid, fields: field_map, importance: imp })
+        }) {
+            Ok(r) => r.flatten().collect(),
+            Err(_) => continue,
+        };
+
+        rows.extend(hits);
+    }
+
     rows
 }
 
