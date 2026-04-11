@@ -1,5 +1,4 @@
-mod db;
-mod llm;
+use memory39::{db, llm};
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
