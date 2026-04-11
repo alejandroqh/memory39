@@ -160,6 +160,29 @@ enum Command {
         /// Max results to return
         #[arg(short, long, default_value = "10")]
         limit: usize,
+        /// Minimum importance (0-10)
+        #[arg(long)]
+        min: Option<u8>,
+        /// Filter by date range start (YYYY-MM-DD)
+        #[arg(long)]
+        from: Option<String>,
+        /// Filter by date range end (YYYY-MM-DD)
+        #[arg(long)]
+        to: Option<String>,
+        /// Filter by memory kind: event, undated, thing, person, place
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// Find connections between 2-3 concepts across all memories
+    Connect {
+        /// Concepts to connect (2-3 required)
+        concepts: Vec<String>,
+        /// Minimum importance (0-10)
+        #[arg(long)]
+        min: Option<u8>,
+        /// Timeout in milliseconds
+        #[arg(long, default_value = "2000")]
+        timeout: u64,
     },
     /// Remember a place (spatial memory)
     Place {
@@ -215,7 +238,6 @@ fn main() {
                 &conn,
                 &event,
                 datetime.as_deref(),
-                date.as_deref(),
                 note.as_deref(),
                 tags.as_deref(),
                 importance,
@@ -284,7 +306,6 @@ fn main() {
             if let Some(v) = source { changes.push(("source".into(), v)); }
             if let Some(d) = &date {
                 let t = time.as_deref().unwrap_or("00:00");
-                changes.push(("date".into(), d.clone()));
                 changes.push(("datetime".into(), format!("{} {}", d, t)));
             } else if time.is_some() {
                 eprintln!("Warning: --time without --date ignored (need both to update datetime)");
@@ -300,19 +321,61 @@ fn main() {
                 }
             }
         }
-        Command::Recall { query, limit } => {
-            let results = db::recall(&conn, &query, limit);
+        Command::Recall { query, limit, min, from, to, kind } => {
+            let filters = db::RecallFilters {
+                min_importance: min,
+                date_from: from,
+                date_to: to,
+                memory_type: kind,
+            };
+            let results = db::recall(&conn, &query, limit, &filters);
             if results.is_empty() {
                 println!("No memories found for: {}", query);
             } else {
                 println!("Found {} memories for: {}", results.len(), query);
                 for r in &results {
-                    println!("\n[{}] {}", r.mid, r.memory_type);
+                    println!("\n[{}] {} (score: {:.2})", r.mid, r.memory_type, r.score);
                     for (key, val) in &r.fields {
                         println!("  {:10} {}", format!("{}:", key), val);
                     }
                 }
             }
+        }
+        Command::Connect { concepts, min, timeout } => {
+            if concepts.len() < 2 || concepts.len() > 3 {
+                eprintln!("Error: provide 2 or 3 concepts");
+                std::process::exit(1);
+            }
+            let timeout_dur = std::time::Duration::from_millis(timeout);
+            let result = db::find_connections(&conn, &concepts, min, timeout_dur);
+            let elapsed = result.elapsed_ms;
+
+            if result.connections.is_empty() {
+                println!("No connections found for: {}", concepts.join(" + "));
+            } else {
+                println!("Connections for: {}\n", concepts.join(" + "));
+                for c in &result.connections {
+                    match &c.kind {
+                        db::ConnectionKind::Direct { mid } => {
+                            println!("[direct] {} (score: {:.2})", mid, c.score);
+                            println!("  All concepts in same memory");
+                            for (key, val) in &c.fields {
+                                println!("  {:10} {}", format!("{}:", key), val);
+                            }
+                        }
+                        db::ConnectionKind::Shared { mid_a, mid_b, field, value } => {
+                            println!("[shared:{}] {} <> {} (score: {:.2})", field, mid_a, mid_b, c.score);
+                            println!("  Linked by: {}", value);
+                        }
+                        db::ConnectionKind::Bridge { mid_a, mid_b, via_field, via_value } => {
+                            println!("[bridge:{}] {} -> {} (score: {:.2})", via_field, mid_a, mid_b, c.score);
+                            println!("  Via: {}", via_value);
+                        }
+                    }
+                    println!();
+                }
+            }
+            println!("Found {} connections in {}ms", result.connections.len(), elapsed);
         }
         Command::Thing {
             thing,
