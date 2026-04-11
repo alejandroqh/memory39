@@ -16,6 +16,7 @@ pub fn open(path: &Path) -> Result<Connection> {
     ")?;
 
     conn.execute_batch(SCHEMA)?;
+    migrate_fts_tokenizer(&conn)?;
     Ok(conn)
 }
 
@@ -28,6 +29,86 @@ pub fn open_ram() -> Result<Connection> {
     ")?;
     conn.execute_batch(SCHEMA)?;
     Ok(conn)
+}
+
+const FTS_TABLES: &[(&str, &[&str])] = &[
+    ("events_fts",         &["events_ai", "events_ad", "events_au"]),
+    ("events_undated_fts", &["events_undated_ai", "events_undated_ad", "events_undated_au"]),
+    ("things_fts",         &["things_ai", "things_ad", "things_au"]),
+    ("persons_fts",        &["persons_ai", "persons_ad", "persons_au"]),
+    ("places_fts",         &["places_ai", "places_ad", "places_au"]),
+];
+
+/// Migrate FTS5 tables to use unicode61 with diacritics removal.
+/// Checks each table's DDL in sqlite_master; if it lacks 'remove_diacritics',
+/// drops and recreates it from SCHEMA, then rebuilds the index.
+fn migrate_fts_tokenizer(conn: &Connection) -> Result<()> {
+    let mut to_migrate: Vec<(&str, &[&str])> = Vec::new();
+
+    for (fts_table, triggers) in FTS_TABLES {
+        let needs_migration = match conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+            [fts_table],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(sql) => !sql.contains("remove_diacritics"),
+            Err(_) => false,
+        };
+        if needs_migration {
+            to_migrate.push((fts_table, triggers));
+        }
+    }
+
+    if to_migrate.is_empty() {
+        return Ok(());
+    }
+
+    for (fts_table, triggers) in &to_migrate {
+        for trigger in *triggers {
+            conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {}", trigger))?;
+        }
+        conn.execute_batch(&format!("DROP TABLE IF EXISTS {}", fts_table))?;
+    }
+
+    conn.execute_batch(SCHEMA)?;
+
+    for (fts_table, _) in &to_migrate {
+        conn.execute_batch(&format!(
+            "INSERT INTO {}({}) VALUES('rebuild')", fts_table, fts_table
+        ))?;
+    }
+
+    Ok(())
+}
+
+const PREFIX_MIN_LEN: usize = 6;
+
+/// Expand a query for prefix matching: truncate words > min_len chars and add '*'.
+/// Returns None if query uses FTS5 operators or no words were expanded.
+fn expand_query_for_prefix(query: &str) -> Option<String> {
+    // Don't mangle queries with explicit FTS5 syntax
+    if query.contains('"') || query.contains('*') || query.contains('(')
+        || query.contains(')') || query.contains(':')
+    {
+        return None;
+    }
+    let upper = query.to_uppercase();
+    if upper.contains(" AND ") || upper.contains(" OR ") || upper.contains(" NOT ")
+        || upper.contains("NEAR")
+    {
+        return None;
+    }
+
+    let terms: Vec<String> = query.split_whitespace().map(|w| {
+        if w.chars().count() > PREFIX_MIN_LEN {
+            let prefix: String = w.chars().take(PREFIX_MIN_LEN).collect();
+            format!("{}*", prefix)
+        } else {
+            w.to_string()
+        }
+    }).collect();
+
+    if terms.iter().any(|t| t.ends_with('*')) { Some(terms.join(" ")) } else { None }
 }
 
 const SCHEMA: &str = "
@@ -57,7 +138,8 @@ CREATE INDEX IF NOT EXISTS idx_events_importance ON events(importance DESC);
 CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
     event, note, tags, emotion, location, people,
     content=events,
-    content_rowid=id
+    content_rowid=id,
+    tokenize='unicode61 remove_diacritics 2'
 );
 
 -- Keep FTS in sync
@@ -96,7 +178,8 @@ CREATE INDEX IF NOT EXISTS idx_events_undated_importance ON events_undated(impor
 CREATE VIRTUAL TABLE IF NOT EXISTS events_undated_fts USING fts5(
     event, note, tags, emotion, location, people,
     content=events_undated,
-    content_rowid=id
+    content_rowid=id,
+    tokenize='unicode61 remove_diacritics 2'
 );
 
 CREATE TRIGGER IF NOT EXISTS events_undated_ai AFTER INSERT ON events_undated BEGIN
@@ -134,7 +217,8 @@ CREATE INDEX IF NOT EXISTS idx_things_importance ON things(importance DESC);
 CREATE VIRTUAL TABLE IF NOT EXISTS things_fts USING fts5(
     thing, desc, category, tags, emotion, related,
     content=things,
-    content_rowid=id
+    content_rowid=id,
+    tokenize='unicode61 remove_diacritics 2'
 );
 
 CREATE TRIGGER IF NOT EXISTS things_ai AFTER INSERT ON things BEGIN
@@ -173,7 +257,8 @@ CREATE INDEX IF NOT EXISTS idx_persons_importance ON persons(importance DESC);
 CREATE VIRTUAL TABLE IF NOT EXISTS persons_fts USING fts5(
     name, role, relationship, note, tags, emotion,
     content=persons,
-    content_rowid=id
+    content_rowid=id,
+    tokenize='unicode61 remove_diacritics 2'
 );
 
 CREATE TRIGGER IF NOT EXISTS persons_ai AFTER INSERT ON persons BEGIN
@@ -210,7 +295,8 @@ CREATE INDEX IF NOT EXISTS idx_places_importance ON places(importance DESC);
 CREATE VIRTUAL TABLE IF NOT EXISTS places_fts USING fts5(
     name, desc, address, kind, note, tags, emotion,
     content=places,
-    content_rowid=id
+    content_rowid=id,
+    tokenize='unicode61 remove_diacritics 2'
 );
 
 CREATE TRIGGER IF NOT EXISTS places_ai AFTER INSERT ON places BEGIN
@@ -356,7 +442,26 @@ pub struct RecallResult {
 
 /// Search across all memory tables with composite scoring and filters.
 /// Score = 0.4 * relevance + 0.3 * importance + 0.3 * recency
+/// Uses two-phase query: exact match first, then prefix-expanded fallback for
+/// multilingual morphological variants (e.g. "desarrollando" → "desarr*").
 pub fn recall(conn: &Connection, query: &str, limit: usize, filters: &RecallFilters) -> Vec<RecallResult> {
+    let mut results = recall_inner(conn, query, limit, filters);
+
+    if results.len() < limit {
+        if let Some(expanded) = expand_query_for_prefix(query) {
+            let seen: HashSet<String> = results.iter().map(|r| r.mid.clone()).collect();
+            let mut extra = recall_inner(conn, &expanded, limit, filters);
+            extra.retain(|r| !seen.contains(&r.mid));
+            results.extend(extra);
+            results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            results.truncate(limit);
+        }
+    }
+
+    results
+}
+
+fn recall_inner(conn: &Connection, query: &str, limit: usize, filters: &RecallFilters) -> Vec<RecallResult> {
     let mut results = Vec::new();
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
 
@@ -818,13 +923,24 @@ pub fn find_connections(
     let mut connections: Vec<Connection_> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
-    // Phase 1: Direct - FTS5 AND query
+    // Phase 1: Direct - FTS5 AND query (exact then prefix fallback)
     let and_query = concepts.iter()
         .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(" AND ");
 
     phase_direct(conn, &and_query, min_importance, &mut connections, &mut seen);
+
+    if connections.is_empty() {
+        // Prefix fallback for direct phase
+        let prefix_and = concepts.iter()
+            .filter_map(|c| expand_query_for_prefix(c))
+            .collect::<Vec<_>>();
+        if prefix_and.len() == concepts.len() {
+            let and_expanded = prefix_and.join(" AND ");
+            phase_direct(conn, &and_expanded, min_importance, &mut connections, &mut seen);
+        }
+    }
 
     if start.elapsed() >= timeout {
         return ConnectionResult { connections, elapsed_ms: start.elapsed().as_millis() };
@@ -834,7 +950,15 @@ pub fn find_connections(
     let mut concept_rows: Vec<Vec<MemRow>> = Vec::new();
     for concept in concepts {
         let escaped = format!("\"{}\"", concept.replace('"', "\"\""));
-        let rows = search_mem_rows(conn, &escaped, min_importance);
+        let mut rows = search_mem_rows(conn, &escaped, min_importance);
+        // Prefix fallback if exact match found few rows
+        if rows.len() < 5 {
+            if let Some(expanded) = expand_query_for_prefix(concept) {
+                let seen_mids: HashSet<String> = rows.iter().map(|r| r.mid.clone()).collect();
+                let extra = search_mem_rows(conn, &expanded, min_importance);
+                rows.extend(extra.into_iter().filter(|r| !seen_mids.contains(&r.mid)));
+            }
+        }
         concept_rows.push(rows);
 
         if start.elapsed() >= timeout {
@@ -1247,5 +1371,114 @@ fn find_overlap(a: &str, b: &str) -> Option<String> {
         if a == b { Some(a.to_string()) } else { None }
     } else {
         Some(overlap.iter().map(|s| **s).collect::<Vec<_>>().join(","))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> Connection {
+        open_ram().expect("failed to create test db")
+    }
+
+    fn ts() -> String {
+        "2026-04-11 12:00".to_string()
+    }
+
+    // --- expand_query_for_prefix ---
+
+    #[test]
+    fn test_prefix_expansion_long_words() {
+        let result = expand_query_for_prefix("desarrollando proyecto");
+        assert_eq!(result, Some("desarr* proyec*".to_string()));
+    }
+
+    #[test]
+    fn test_prefix_expansion_short_words_unchanged() {
+        assert_eq!(expand_query_for_prefix("café"), None);
+        assert_eq!(expand_query_for_prefix("hola mundo"), None);
+    }
+
+    #[test]
+    fn test_prefix_expansion_mixed() {
+        let result = expand_query_for_prefix("el desarrollo");
+        assert_eq!(result, Some("el desarr*".to_string()));
+    }
+
+    #[test]
+    fn test_prefix_expansion_skips_fts5_syntax() {
+        assert_eq!(expand_query_for_prefix("\"exact phrase\""), None);
+        assert_eq!(expand_query_for_prefix("hello AND world"), None);
+        assert_eq!(expand_query_for_prefix("prefix*"), None);
+    }
+
+    // --- diacritics removal ---
+
+    #[test]
+    fn test_diacritics_match() {
+        let conn = test_db();
+        insert_thing(&conn, "café con leche", None, None, None, 7, None, None, 5, None, &ts()).unwrap();
+
+        let filters = RecallFilters { min_importance: None, date_from: None, date_to: None, memory_type: None };
+        let results = recall(&conn, "cafe", 10, &filters);
+        assert!(!results.is_empty(), "café should match cafe");
+    }
+
+    #[test]
+    fn test_diacritics_spanish_accents() {
+        let conn = test_db();
+        insert_event(&conn, "reunión con María", Some("2026-04-11 10:00"), None, None, 6, None, None, None, None, &ts()).unwrap();
+
+        let filters = RecallFilters { min_importance: None, date_from: None, date_to: None, memory_type: None };
+        let results = recall(&conn, "reunion maria", 10, &filters);
+        assert!(!results.is_empty(), "reunión/María should match reunion/maria");
+    }
+
+    // --- prefix fallback for Spanish morphology ---
+
+    #[test]
+    fn test_prefix_fallback_spanish() {
+        let conn = test_db();
+        insert_event(&conn, "desarrollo de software", Some("2026-04-01 09:00"), None,
+            Some("programación,rust"), 8, None, None, None, None, &ts()).unwrap();
+
+        let filters = RecallFilters { min_importance: None, date_from: None, date_to: None, memory_type: None };
+        // "desarrollando" should match "desarrollo" via prefix fallback (desarr*)
+        let results = recall(&conn, "desarrollando", 10, &filters);
+        assert!(!results.is_empty(), "desarrollando should match desarrollo via prefix fallback");
+    }
+
+    #[test]
+    fn test_exact_match_preferred_over_prefix() {
+        let conn = test_db();
+        insert_thing(&conn, "desarrollo ágil", None, None, None, 7, None, None, 5, None, &ts()).unwrap();
+        insert_thing(&conn, "desarraigo cultural", None, None, None, 7, None, None, 5, None, &ts()).unwrap();
+
+        let filters = RecallFilters { min_importance: None, date_from: None, date_to: None, memory_type: None };
+        let results = recall(&conn, "desarrollo", 10, &filters);
+        assert!(!results.is_empty());
+        // Exact match "desarrollo" should appear first (higher score than prefix match "desarraigo")
+        assert!(results[0].fields.iter().any(|(_, v)| v.contains("desarrollo")),
+            "exact match should rank first");
+    }
+
+    // --- migration ---
+
+    #[test]
+    fn test_migration_idempotent() {
+        let conn = open_ram().unwrap();
+        // Running migrate again on an already-migrated db should be a no-op
+        migrate_fts_tokenizer(&conn).unwrap();
+        // Insert should still work
+        insert_event(&conn, "test event", None, None, None, 5, None, None, None, None, &ts()).unwrap();
+    }
+
+    #[test]
+    fn test_recall_with_no_results_no_panic() {
+        let conn = test_db();
+        let filters = RecallFilters { min_importance: None, date_from: None, date_to: None, memory_type: None };
+        let results = recall(&conn, "nonexistent query", 10, &filters);
+        assert!(results.is_empty());
     }
 }
