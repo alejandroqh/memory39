@@ -52,7 +52,7 @@ MEMORY39_BIN="$PROJECT_DIR/target/release/memory39"
 # Step 2: Clone AMB if needed
 if [ ! -d "$AMB_DIR" ]; then
     echo "--- Cloning agent-memory-benchmark ---"
-    git clone https://github.com/vectorize-io/agent-memory-benchmark.git "$AMB_DIR"
+    git clone --depth 1 https://github.com/vectorize-io/agent-memory-benchmark.git "$AMB_DIR"
 fi
 
 # Step 3: Set up venv if needed
@@ -92,10 +92,17 @@ open(f, 'w').write(txt)
 "
 fi
 
-# Step 5: Export env vars for the provider
+# Step 5: Export env vars
 export MEMORY39_BIN="$MEMORY39_BIN"
 export MEMORY39_LLM="$LLM"
 export MEMORY39_MODEL="${MODEL:-}"
+# Load GEMINI_API_KEY from project .env for AMB's judge/answer LLM
+if [ -f "$PROJECT_DIR/.env" ]; then
+    GEMINI_KEY=$(grep '^GEMINI_API_KEY=' "$PROJECT_DIR/.env" | cut -d= -f2-)
+    if [ -n "$GEMINI_KEY" ]; then
+        export GEMINI_API_KEY="$GEMINI_KEY"
+    fi
+fi
 
 # Step 6: Run benchmark
 echo ""
