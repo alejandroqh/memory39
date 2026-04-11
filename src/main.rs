@@ -195,6 +195,12 @@ enum Command {
         /// Filter by memory kind: event, undated, thing, person, place
         #[arg(long)]
         kind: Option<String>,
+        /// Filter by source: experienced, told, read, observed
+        #[arg(long)]
+        source: Option<String>,
+        /// Skip first N results (for pagination)
+        #[arg(long, default_value = "0")]
+        offset: usize,
     },
     /// Find connections between 2-3 concepts across all memories
     Connect {
@@ -273,8 +279,9 @@ async fn main() {
                     date_from: None,
                     date_to: None,
                     memory_type: None,
+                    source: None,
                 };
-                let results = db::recall(&conn, query, 5, &filters);
+                let results = db::recall(&conn, query, 5, 0, &filters);
                 if results.is_empty() {
                     "No existing memories found.".into()
                 } else {
@@ -458,14 +465,15 @@ async fn main() {
                 }
             }
         }
-        Command::Recall { query, limit, min, from, to, kind } => {
+        Command::Recall { query, limit, min, from, to, kind, source, offset } => {
             let filters = db::RecallFilters {
                 min_importance: min,
                 date_from: from,
                 date_to: to,
                 memory_type: kind,
+                source,
             };
-            let results = db::recall(&conn, &query, limit, &filters);
+            let results = db::recall(&conn, &query, limit, offset, &filters);
             if results.is_empty() {
                 println!("No memories found for: {}", query);
             } else {

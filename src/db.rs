@@ -431,6 +431,7 @@ pub struct RecallFilters {
     pub date_from: Option<String>,
     pub date_to: Option<String>,
     pub memory_type: Option<String>,
+    pub source: Option<String>,
 }
 
 pub struct RecallResult {
@@ -444,196 +445,269 @@ pub struct RecallResult {
 /// Score = 0.4 * relevance + 0.3 * importance + 0.3 * recency
 /// Uses two-phase query: exact match first, then prefix-expanded fallback for
 /// multilingual morphological variants (e.g. "desarrollando" → "desarr*").
-pub fn recall(conn: &Connection, query: &str, limit: usize, filters: &RecallFilters) -> Vec<RecallResult> {
-    let mut results = recall_inner(conn, query, limit, filters);
+pub fn recall(conn: &Connection, query: &str, limit: usize, offset: usize, filters: &RecallFilters) -> Vec<RecallResult> {
+    let query = query.trim();
+    let is_wildcard = query.is_empty() || query == "*";
+    let fetch = limit + offset;
 
-    if results.len() < limit {
-        if let Some(expanded) = expand_query_for_prefix(query) {
-            let seen: HashSet<String> = results.iter().map(|r| r.mid.clone()).collect();
-            let mut extra = recall_inner(conn, &expanded, limit, filters);
-            extra.retain(|r| !seen.contains(&r.mid));
-            results.extend(extra);
-            results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-            results.truncate(limit);
+    let mut results = if is_wildcard {
+        recall_all_inner(conn, fetch, filters)
+    } else {
+        let mut results = recall_inner(conn, query, fetch, filters);
+        if results.len() < fetch {
+            if let Some(expanded) = expand_query_for_prefix(query) {
+                let seen: HashSet<String> = results.iter().map(|r| r.mid.clone()).collect();
+                let mut extra = recall_inner(conn, &expanded, fetch, filters);
+                extra.retain(|r| !seen.contains(&r.mid));
+                results.extend(extra);
+                results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                results.truncate(fetch);
+            }
+        }
+        results
+    };
+
+    if offset > 0 && offset < results.len() {
+        results.drain(..offset);
+    } else if offset >= results.len() {
+        return Vec::new();
+    }
+    results.truncate(limit);
+    results
+}
+
+/// Build filter WHERE clauses and params for recall queries.
+/// Returns (" AND alias.col >= ?N ..." fragments, params).
+/// `idx_start` is the param index for the first filter (3 for FTS after ?1=query/?2=limit, 1 for non-FTS).
+fn build_recall_filters(
+    alias: &str,
+    filters: &RecallFilters,
+    idx_start: usize,
+    include_dates: bool,
+    include_source: bool,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let mut clauses = String::new();
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+    if let Some(min) = filters.min_importance {
+        clauses.push_str(&format!(" AND {}.importance >= ?{}", alias, idx_start + params.len()));
+        params.push(Box::new(min));
+    }
+    if include_dates {
+        if let Some(ref from) = filters.date_from {
+            clauses.push_str(&format!(" AND substr({}.datetime, 1, 10) >= ?{}", alias, idx_start + params.len()));
+            params.push(Box::new(from.clone()));
+        }
+        if let Some(ref to) = filters.date_to {
+            clauses.push_str(&format!(" AND substr({}.datetime, 1, 10) <= ?{}", alias, idx_start + params.len()));
+            params.push(Box::new(to.clone()));
+        }
+    }
+    if include_source {
+        if let Some(ref source) = filters.source {
+            clauses.push_str(&format!(" AND lower({}.source) = lower(?{})", alias, idx_start + params.len()));
+            params.push(Box::new(source.clone()));
         }
     }
 
-    results
+    (clauses, params)
 }
 
 fn recall_inner(conn: &Connection, query: &str, limit: usize, filters: &RecallFilters) -> Vec<RecallResult> {
     let mut results = Vec::new();
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
 
-    let skip_dated = filters.memory_type.as_ref().is_some_and(|t| t == "undated");
-    let skip_undated = filters.memory_type.as_ref().is_some_and(|t| t == "event");
+    let has_date_filter = filters.date_from.is_some() || filters.date_to.is_some();
+    let skip_dated = filters.memory_type.as_ref().is_some_and(|t| t != "event");
+    let skip_undated = filters.memory_type.as_ref().is_some_and(|t| t != "undated") || has_date_filter;
 
-    // Search dated events
     if !skip_dated {
-        let mut where_extra = String::new();
-        let mut extra_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-        if let Some(min) = filters.min_importance {
-            where_extra.push_str(" AND e.importance >= ?3");
-            extra_params.push(Box::new(min));
-        }
-        if let Some(ref from) = filters.date_from {
-            let idx = 3 + extra_params.len();
-            where_extra.push_str(&format!(" AND substr(e.datetime, 1, 10) >= ?{}", idx));
-            extra_params.push(Box::new(from.clone()));
-        }
-        if let Some(ref to) = filters.date_to {
-            let idx = 3 + extra_params.len();
-            where_extra.push_str(&format!(" AND substr(e.datetime, 1, 10) <= ?{}", idx));
-            extra_params.push(Box::new(to.clone()));
-        }
-
+        let (fc, fp) = build_recall_filters("e", filters, 3, true, true);
         let sql = format!(
             "SELECT e.id, rank, e.event, e.datetime, e.note, e.tags, e.importance,
                     e.emotion, e.location, e.people, e.source, e.created_at
-             FROM events_fts f
-             JOIN events e ON e.id = f.rowid
-             WHERE events_fts MATCH ?1{}
-             LIMIT ?2",
-            where_extra
-        );
-
-        recall_fts(conn, &mut results, limit, &sql, query, true, &extra_params, &now);
+             FROM events_fts f JOIN events e ON e.id = f.rowid
+             WHERE events_fts MATCH ?1{} LIMIT ?2", fc);
+        let params = fts_params(query, limit, fp);
+        recall_event_query(conn, &mut results, &sql, &params, true, &now);
     }
 
-    // Search undated events (date range filters don't apply)
     if !skip_undated {
-        let mut where_extra = String::new();
-        let mut extra_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-        if let Some(min) = filters.min_importance {
-            where_extra.push_str(" AND u.importance >= ?3");
-            extra_params.push(Box::new(min));
-        }
-
+        let (fc, fp) = build_recall_filters("u", filters, 3, false, true);
         let sql = format!(
             "SELECT u.id, rank, u.event, u.note, u.tags, u.importance,
                     u.emotion, u.location, u.people, u.source, u.created_at
-             FROM events_undated_fts f
-             JOIN events_undated u ON u.id = f.rowid
-             WHERE events_undated_fts MATCH ?1{}
-             LIMIT ?2",
-            where_extra
-        );
-
-        recall_fts(conn, &mut results, limit, &sql, query, false, &extra_params, &now);
+             FROM events_undated_fts f JOIN events_undated u ON u.id = f.rowid
+             WHERE events_undated_fts MATCH ?1{} LIMIT ?2", fc);
+        let params = fts_params(query, limit, fp);
+        recall_event_query(conn, &mut results, &sql, &params, false, &now);
     }
 
-    let skip_things = filters.memory_type.as_ref().is_some_and(|t| t != "thing");
-    let skip_persons = filters.memory_type.as_ref().is_some_and(|t| t != "person");
-    let skip_places = filters.memory_type.as_ref().is_some_and(|t| t != "place");
+    let skip_things = filters.memory_type.as_ref().is_some_and(|t| t != "thing") || has_date_filter;
+    let skip_persons = filters.memory_type.as_ref().is_some_and(|t| t != "person") || filters.source.is_some() || has_date_filter;
+    let skip_places = filters.memory_type.as_ref().is_some_and(|t| t != "place") || filters.source.is_some() || has_date_filter;
 
-    // Search things
     if !skip_things {
-        let mut where_extra = String::new();
-        let mut extra_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-        if let Some(min) = filters.min_importance {
-            where_extra.push_str(" AND t.importance >= ?3");
-            extra_params.push(Box::new(min));
-        }
-
+        let (fc, fp) = build_recall_filters("t", filters, 3, false, true);
         let sql = format!(
             "SELECT t.id, rank, t.thing, t.desc, t.category, t.tags, t.importance,
                     t.emotion, t.source, t.confidence, t.related, t.created_at
-             FROM things_fts f
-             JOIN things t ON t.id = f.rowid
-             WHERE things_fts MATCH ?1{}
-             LIMIT ?2",
-            where_extra
-        );
-
-        recall_generic(conn, &mut results, limit, &sql, query, &extra_params, &now,
+             FROM things_fts f JOIN things t ON t.id = f.rowid
+             WHERE things_fts MATCH ?1{} LIMIT ?2", fc);
+        let params = fts_params(query, limit, fp);
+        recall_generic_query(conn, &mut results, &sql, &params, &now,
             "thing", "T", &["Thing", "Description", "Category", "Tags", "Importance",
-                            "Emotion", "Source", "Confidence", "Related"]);
+                            "Emotion", "Source", "Confidence", "Related", "Stored"]);
     }
 
-    // Search persons
     if !skip_persons {
-        let mut where_extra = String::new();
-        let mut extra_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-        if let Some(min) = filters.min_importance {
-            where_extra.push_str(" AND p.importance >= ?3");
-            extra_params.push(Box::new(min));
-        }
-
+        let (fc, fp) = build_recall_filters("p", filters, 3, false, false);
         let sql = format!(
             "SELECT p.id, rank, p.name, p.role, p.relationship, p.contact, p.met_at,
                     p.last_seen, p.note, p.tags, p.importance, p.emotion, p.created_at
-             FROM persons_fts f
-             JOIN persons p ON p.id = f.rowid
-             WHERE persons_fts MATCH ?1{}
-             LIMIT ?2",
-            where_extra
-        );
-
-        recall_generic(conn, &mut results, limit, &sql, query, &extra_params, &now,
+             FROM persons_fts f JOIN persons p ON p.id = f.rowid
+             WHERE persons_fts MATCH ?1{} LIMIT ?2", fc);
+        let params = fts_params(query, limit, fp);
+        recall_generic_query(conn, &mut results, &sql, &params, &now,
             "person", "P", &["Name", "Role", "Relationship", "Contact", "Met at",
-                             "Last seen", "Note", "Tags", "Importance", "Emotion"]);
+                             "Last seen", "Note", "Tags", "Importance", "Emotion", "Stored"]);
     }
 
-    // Search places
     if !skip_places {
-        let mut where_extra = String::new();
-        let mut extra_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-        if let Some(min) = filters.min_importance {
-            where_extra.push_str(" AND l.importance >= ?3");
-            extra_params.push(Box::new(min));
-        }
-
+        let (fc, fp) = build_recall_filters("l", filters, 3, false, false);
         let sql = format!(
             "SELECT l.id, rank, l.name, l.desc, l.address, l.kind, l.note, l.tags,
                     l.importance, l.emotion, l.created_at
-             FROM places_fts f
-             JOIN places l ON l.id = f.rowid
-             WHERE places_fts MATCH ?1{}
-             LIMIT ?2",
-            where_extra
-        );
-
-        recall_generic(conn, &mut results, limit, &sql, query, &extra_params, &now,
+             FROM places_fts f JOIN places l ON l.id = f.rowid
+             WHERE places_fts MATCH ?1{} LIMIT ?2", fc);
+        let params = fts_params(query, limit, fp);
+        recall_generic_query(conn, &mut results, &sql, &params, &now,
             "place", "L", &["Name", "Description", "Address", "Kind", "Note", "Tags",
-                            "Importance", "Emotion"]);
+                            "Importance", "Emotion", "Stored"]);
     }
 
-    // Sort by composite score descending
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     results.truncate(limit);
     results
 }
 
-fn recall_fts(
+/// Recall all memories without FTS (wildcard query). Scans tables directly.
+fn recall_all_inner(conn: &Connection, limit: usize, filters: &RecallFilters) -> Vec<RecallResult> {
+    let mut results = Vec::new();
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+
+    let has_date_filter = filters.date_from.is_some() || filters.date_to.is_some();
+    let skip_dated = filters.memory_type.as_ref().is_some_and(|t| t != "event");
+    let skip_undated = filters.memory_type.as_ref().is_some_and(|t| t != "undated") || has_date_filter;
+
+    if !skip_dated {
+        let (fc, fp) = build_recall_filters("e", filters, 1, true, true);
+        let (where_sql, mut params) = scan_where(fc, fp);
+        params.push(Box::new(limit as i64));
+        let sql = format!(
+            "SELECT e.id, 0.0 as rank, e.event, e.datetime, e.note, e.tags, e.importance,
+                    e.emotion, e.location, e.people, e.source, e.created_at
+             FROM events e {} ORDER BY e.importance DESC, e.created_at DESC LIMIT ?{}",
+            where_sql, params.len());
+        recall_event_query(conn, &mut results, &sql, &params, true, &now);
+    }
+
+    if !skip_undated {
+        let (fc, fp) = build_recall_filters("u", filters, 1, false, true);
+        let (where_sql, mut params) = scan_where(fc, fp);
+        params.push(Box::new(limit as i64));
+        let sql = format!(
+            "SELECT u.id, 0.0 as rank, u.event, u.note, u.tags, u.importance,
+                    u.emotion, u.location, u.people, u.source, u.created_at
+             FROM events_undated u {} ORDER BY u.importance DESC, u.created_at DESC LIMIT ?{}",
+            where_sql, params.len());
+        recall_event_query(conn, &mut results, &sql, &params, false, &now);
+    }
+
+    let skip_things = filters.memory_type.as_ref().is_some_and(|t| t != "thing") || has_date_filter;
+    let skip_persons = filters.memory_type.as_ref().is_some_and(|t| t != "person") || filters.source.is_some() || has_date_filter;
+    let skip_places = filters.memory_type.as_ref().is_some_and(|t| t != "place") || filters.source.is_some() || has_date_filter;
+
+    if !skip_things {
+        let (fc, fp) = build_recall_filters("t", filters, 1, false, true);
+        let (where_sql, mut params) = scan_where(fc, fp);
+        params.push(Box::new(limit as i64));
+        let sql = format!(
+            "SELECT t.id, 0.0 as rank, t.thing, t.desc, t.category, t.tags, t.importance,
+                    t.emotion, t.source, t.confidence, t.related, t.created_at
+             FROM things t {} ORDER BY t.importance DESC, t.created_at DESC LIMIT ?{}",
+            where_sql, params.len());
+        recall_generic_query(conn, &mut results, &sql, &params, &now,
+            "thing", "T", &["Thing", "Description", "Category", "Tags", "Importance",
+                            "Emotion", "Source", "Confidence", "Related", "Stored"]);
+    }
+
+    if !skip_persons {
+        let (fc, fp) = build_recall_filters("p", filters, 1, false, false);
+        let (where_sql, mut params) = scan_where(fc, fp);
+        params.push(Box::new(limit as i64));
+        let sql = format!(
+            "SELECT p.id, 0.0 as rank, p.name, p.role, p.relationship, p.contact, p.met_at,
+                    p.last_seen, p.note, p.tags, p.importance, p.emotion, p.created_at
+             FROM persons p {} ORDER BY p.importance DESC, p.created_at DESC LIMIT ?{}",
+            where_sql, params.len());
+        recall_generic_query(conn, &mut results, &sql, &params, &now,
+            "person", "P", &["Name", "Role", "Relationship", "Contact", "Met at",
+                             "Last seen", "Note", "Tags", "Importance", "Emotion", "Stored"]);
+    }
+
+    if !skip_places {
+        let (fc, fp) = build_recall_filters("l", filters, 1, false, false);
+        let (where_sql, mut params) = scan_where(fc, fp);
+        params.push(Box::new(limit as i64));
+        let sql = format!(
+            "SELECT l.id, 0.0 as rank, l.name, l.desc, l.address, l.kind, l.note, l.tags,
+                    l.importance, l.emotion, l.created_at
+             FROM places l {} ORDER BY l.importance DESC, l.created_at DESC LIMIT ?{}",
+            where_sql, params.len());
+        recall_generic_query(conn, &mut results, &sql, &params, &now,
+            "place", "L", &["Name", "Description", "Address", "Kind", "Note", "Tags",
+                            "Importance", "Emotion", "Stored"]);
+    }
+
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(limit);
+    results
+}
+
+/// Prepend FTS query + limit to filter params.
+fn fts_params(query: &str, limit: usize, filter_params: Vec<Box<dyn rusqlite::types::ToSql>>) -> Vec<Box<dyn rusqlite::types::ToSql>> {
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(2 + filter_params.len());
+    params.push(Box::new(query.to_string()));
+    params.push(Box::new(limit as i64));
+    params.extend(filter_params);
+    params
+}
+
+/// Convert " AND ..." filter clauses into a standalone WHERE clause for non-FTS queries.
+fn scan_where(clauses: String, params: Vec<Box<dyn rusqlite::types::ToSql>>) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let where_sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", clauses.trim_start_matches(" AND "))
+    };
+    (where_sql, params)
+}
+
+/// Execute a query and build event results.
+fn recall_event_query(
     conn: &Connection,
     results: &mut Vec<RecallResult>,
-    limit: usize,
     sql: &str,
-    query: &str,
+    params: &[Box<dyn rusqlite::types::ToSql>],
     dated: bool,
-    extra_params: &[Box<dyn rusqlite::types::ToSql>],
     now: &str,
 ) {
     let mut stmt = match conn.prepare(sql) {
         Ok(s) => s,
         Err(e) => { eprintln!("query error: {}", e); return; }
     };
-
-    // Build param list: ?1=query, ?2=limit, ?3..=extra filters
-    let mut param_refs: Vec<&dyn rusqlite::types::ToSql> = Vec::new();
-    let query_str = query.to_string();
-    let limit_val = limit as i64;
-    param_refs.push(&query_str);
-    param_refs.push(&limit_val);
-    for p in extra_params {
-        param_refs.push(p.as_ref());
-    }
-
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     match stmt.query_map(param_refs.as_slice(), |row| {
         Ok(build_event_result(row, dated, now))
     }) {
@@ -646,16 +720,13 @@ fn recall_fts(
     }
 }
 
-/// Generic recall for non-event tables (things, persons, places).
+/// Execute a query and build generic (non-event) results.
 /// `labels` maps to SELECT columns starting at index 2 (after id and rank).
-/// The label named "Importance" or "Confidence" is parsed as i64; all others as String.
-fn recall_generic(
+fn recall_generic_query(
     conn: &Connection,
     results: &mut Vec<RecallResult>,
-    limit: usize,
     sql: &str,
-    query: &str,
-    extra_params: &[Box<dyn rusqlite::types::ToSql>],
+    params: &[Box<dyn rusqlite::types::ToSql>],
     now: &str,
     memory_type: &str,
     prefix: &str,
@@ -665,15 +736,7 @@ fn recall_generic(
         Ok(s) => s,
         Err(e) => { eprintln!("query error: {}", e); return; }
     };
-
-    let mut param_refs: Vec<&dyn rusqlite::types::ToSql> = Vec::new();
-    let query_str = query.to_string();
-    let limit_val = limit as i64;
-    param_refs.push(&query_str);
-    param_refs.push(&limit_val);
-    for p in extra_params {
-        param_refs.push(p.as_ref());
-    }
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
     let mem_type = memory_type.to_string();
     let pfx = prefix.to_string();
@@ -774,7 +837,7 @@ fn build_event_result(row: &Row, dated: bool, now: &str) -> RecallResult {
         None
     };
 
-    let labels = &["Note", "Tags", "Importance", "Emotion", "Location", "People", "Source"];
+    let labels = &["Note", "Tags", "Importance", "Emotion", "Location", "People", "Source", "Stored"];
     let start = if dated { 4 } else { 3 };
     let mut importance: i64 = 5;
 
@@ -1420,8 +1483,8 @@ mod tests {
         let conn = test_db();
         insert_thing(&conn, "café con leche", None, None, None, 7, None, None, 5, None, &ts()).unwrap();
 
-        let filters = RecallFilters { min_importance: None, date_from: None, date_to: None, memory_type: None };
-        let results = recall(&conn, "cafe", 10, &filters);
+        let filters = RecallFilters { min_importance: None, date_from: None, date_to: None, memory_type: None, source: None };
+        let results = recall(&conn, "cafe", 10, 0, &filters);
         assert!(!results.is_empty(), "café should match cafe");
     }
 
@@ -1430,8 +1493,8 @@ mod tests {
         let conn = test_db();
         insert_event(&conn, "reunión con María", Some("2026-04-11 10:00"), None, None, 6, None, None, None, None, &ts()).unwrap();
 
-        let filters = RecallFilters { min_importance: None, date_from: None, date_to: None, memory_type: None };
-        let results = recall(&conn, "reunion maria", 10, &filters);
+        let filters = RecallFilters { min_importance: None, date_from: None, date_to: None, memory_type: None, source: None };
+        let results = recall(&conn, "reunion maria", 10, 0, &filters);
         assert!(!results.is_empty(), "reunión/María should match reunion/maria");
     }
 
@@ -1443,9 +1506,9 @@ mod tests {
         insert_event(&conn, "desarrollo de software", Some("2026-04-01 09:00"), None,
             Some("programación,rust"), 8, None, None, None, None, &ts()).unwrap();
 
-        let filters = RecallFilters { min_importance: None, date_from: None, date_to: None, memory_type: None };
+        let filters = RecallFilters { min_importance: None, date_from: None, date_to: None, memory_type: None, source: None };
         // "desarrollando" should match "desarrollo" via prefix fallback (desarr*)
-        let results = recall(&conn, "desarrollando", 10, &filters);
+        let results = recall(&conn, "desarrollando", 10, 0, &filters);
         assert!(!results.is_empty(), "desarrollando should match desarrollo via prefix fallback");
     }
 
@@ -1455,8 +1518,8 @@ mod tests {
         insert_thing(&conn, "desarrollo ágil", None, None, None, 7, None, None, 5, None, &ts()).unwrap();
         insert_thing(&conn, "desarraigo cultural", None, None, None, 7, None, None, 5, None, &ts()).unwrap();
 
-        let filters = RecallFilters { min_importance: None, date_from: None, date_to: None, memory_type: None };
-        let results = recall(&conn, "desarrollo", 10, &filters);
+        let filters = RecallFilters { min_importance: None, date_from: None, date_to: None, memory_type: None, source: None };
+        let results = recall(&conn, "desarrollo", 10, 0, &filters);
         assert!(!results.is_empty());
         // Exact match "desarrollo" should appear first (higher score than prefix match "desarraigo")
         assert!(results[0].fields.iter().any(|(_, v)| v.contains("desarrollo")),
@@ -1477,8 +1540,8 @@ mod tests {
     #[test]
     fn test_recall_with_no_results_no_panic() {
         let conn = test_db();
-        let filters = RecallFilters { min_importance: None, date_from: None, date_to: None, memory_type: None };
-        let results = recall(&conn, "nonexistent query", 10, &filters);
+        let filters = RecallFilters { min_importance: None, date_from: None, date_to: None, memory_type: None, source: None };
+        let results = recall(&conn, "nonexistent query", 10, 0, &filters);
         assert!(results.is_empty());
     }
 }

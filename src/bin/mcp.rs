@@ -20,26 +20,31 @@ impl Memory39 {
 )]
 impl Memory39 {
     /// Search across all memories with temporal-priority scoring.
+    /// Use "*" or empty string to retrieve all memories (supports pagination via offset).
     #[tool]
     async fn recall(
         &self,
-        #[description("Search query (FTS5 syntax supported)")] query: String,
+        #[description("Search query (FTS5 syntax supported). Use '*' to list all memories")] query: String,
         #[description("Max results to return (default 10, max 100)")] limit: Option<u64>,
         #[description("Minimum importance 0-10")] min_importance: Option<u8>,
         #[description("Date range start YYYY-MM-DD")] from: Option<String>,
         #[description("Date range end YYYY-MM-DD")] to: Option<String>,
         #[description("Filter by kind: event, undated, thing, person, place")] kind: Option<String>,
+        #[description("Filter by source: experienced, told, read, observed")] source: Option<String>,
+        #[description("Skip first N results (for pagination, default 0)")] offset: Option<u64>,
     ) -> McpResult<String> {
         let limit = limit.unwrap_or(10).min(100) as usize;
+        let offset = offset.unwrap_or(0) as usize;
         let results = {
             let conn = self.lock_conn()?;
             let filters = db::RecallFilters {
                 min_importance,
                 date_from: from,
                 date_to: to,
-                memory_type: kind,
+                memory_type: kind.filter(|s| !s.is_empty()),
+                source: source.filter(|s| !s.is_empty()),
             };
-            db::recall(&conn, &query, limit, &filters)
+            db::recall(&conn, &query, limit, offset, &filters)
         };
         if results.is_empty() {
             return Ok(format!("No memories found for: {}", query));
