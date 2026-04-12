@@ -122,19 +122,30 @@ pub fn split_chunks(conversation: &str) -> Vec<Chunk> {
     chunks
 }
 
+/// Check if a line prefix matches case-insensitively (no allocation).
+fn starts_with_ci(line: &str, prefix: &str) -> bool {
+    line.len() >= prefix.len() && line[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+/// Check if line contains a substring case-insensitively (no allocation).
+fn contains_ci(line: &str, needle: &str) -> bool {
+    let n = needle.len();
+    if line.len() < n { return false; }
+    line.as_bytes().windows(n).any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 fn detect_actor(line: &str) -> Option<&'static str> {
-    let lower = line.to_lowercase();
-    if lower.starts_with("user:") || lower.starts_with("human:") || lower.starts_with("customer:") {
+    if starts_with_ci(line, "user:") || starts_with_ci(line, "human:") || starts_with_ci(line, "customer:") {
         Some("user")
-    } else if lower.starts_with("assistant:") || lower.starts_with("agent:") || lower.starts_with("bot:") || lower.starts_with("ai:") {
+    } else if starts_with_ci(line, "assistant:") || starts_with_ci(line, "agent:") || starts_with_ci(line, "bot:") || starts_with_ci(line, "ai:") {
         Some("agent")
-    } else if lower.contains("] user:") || lower.contains("] human:") {
+    } else if contains_ci(line, "] user:") || contains_ci(line, "] human:") {
         Some("user")
-    } else if lower.contains("] assistant:") || lower.contains("] agent:") {
+    } else if contains_ci(line, "] assistant:") || contains_ci(line, "] agent:") {
         Some("agent")
-    } else if lower.starts_with("speaker_a:") || lower.starts_with("speaker_1:") {
+    } else if starts_with_ci(line, "speaker_a:") || starts_with_ci(line, "speaker_1:") {
         Some("user")
-    } else if lower.starts_with("speaker_b:") || lower.starts_with("speaker_2:") {
+    } else if starts_with_ci(line, "speaker_b:") || starts_with_ci(line, "speaker_2:") {
         Some("agent")
     } else {
         None
@@ -238,7 +249,12 @@ pub enum MemoryAction {
 
 // --- Tool definitions ---
 
-fn memory_tools() -> Vec<Tool> {
+fn memory_tools() -> &'static Vec<Tool> {
+    static TOOLS: std::sync::LazyLock<Vec<Tool>> = std::sync::LazyLock::new(memory_tools_init);
+    &TOOLS
+}
+
+fn memory_tools_init() -> Vec<Tool> {
     vec![
         Tool {
             type_: "function".into(),
@@ -624,7 +640,7 @@ pub async fn ingest_conversation(
     let mut all_actions = Vec::new();
     for chunk in &chunks {
         eprint!("  Chunk {}/{}...", chunk.index + 1, total);
-        match process_chunk(config, &client, &tools, &chunk.text, recall_fn).await {
+        match process_chunk(config, &client, tools, &chunk.text, recall_fn).await {
             Ok(actions) => {
                 let stores = actions.iter().filter(|a| !matches!(a, MemoryAction::Recall { .. })).count();
                 eprintln!(" {} actions", stores);

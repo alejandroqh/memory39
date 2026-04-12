@@ -309,6 +309,7 @@ async fn main() {
             let mut updated = 0;
             let mut forgotten = 0;
 
+            conn.execute_batch("BEGIN").expect("failed to begin transaction");
             for action in &actions {
                 match action {
                     llm::MemoryAction::Recall { query } => {
@@ -358,6 +359,7 @@ async fn main() {
                     }
                 }
             }
+            conn.execute_batch("COMMIT").expect("failed to commit transaction");
 
             println!("\nDone: {} stored, {} updated, {} forgotten", stored, updated, forgotten);
         }

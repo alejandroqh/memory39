@@ -470,13 +470,17 @@ fn phase_bridge(
 }
 
 /// Find overlap between two comma-separated value strings.
+/// Uses linear scan — faster than HashSet for typical small tag lists (<10 items).
 fn find_overlap(a: &str, b: &str) -> Option<String> {
-    let set_a: HashSet<&str> = a.split(',').map(|s| s.trim()).collect();
-    let set_b: HashSet<&str> = b.split(',').map(|s| s.trim()).collect();
-    let overlap: Vec<&&str> = set_a.intersection(&set_b).collect();
-    if overlap.is_empty() {
-        if a == b { Some(a.to_string()) } else { None }
-    } else {
-        Some(overlap.iter().map(|s| **s).collect::<Vec<_>>().join(","))
+    if a == b { return Some(a.to_string()); }
+
+    let tags_b: Vec<&str> = b.split(',').map(|s| s.trim()).collect();
+    let mut overlaps = Vec::new();
+    for ta in a.split(',').map(|s| s.trim()) {
+        if tags_b.contains(&ta) {
+            overlaps.push(ta);
+        }
     }
+
+    if overlaps.is_empty() { None } else { Some(overlaps.join(",")) }
 }

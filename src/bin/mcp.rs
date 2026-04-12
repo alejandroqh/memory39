@@ -50,11 +50,13 @@ impl Memory39 {
         if results.is_empty() {
             return Ok(format!("No memories found for: {}", query));
         }
-        let mut out = format!("Found {} memories:\n", results.len());
+        use std::fmt::Write;
+        let mut out = String::with_capacity(results.len() * 200);
+        let _ = writeln!(out, "Found {} memories:", results.len());
         for r in &results {
-            out.push_str(&format!("\n[{}] {} (score: {:.2})\n", r.mid, r.memory_type, r.score));
+            let _ = writeln!(out, "\n[{}] {} (score: {:.2})", r.mid, r.memory_type, r.score);
             for (k, v) in &r.fields {
-                out.push_str(&format!("  {}: {}\n", k, v));
+                let _ = writeln!(out, "  {}: {}", k, v);
             }
         }
         Ok(out)
@@ -366,7 +368,7 @@ impl Memory39 {
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_dir = dirs::home_dir()
         .expect("cannot determine home directory")

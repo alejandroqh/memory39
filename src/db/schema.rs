@@ -77,6 +77,11 @@ pub(crate) const PREFIX_MIN_LEN: usize = 6;
 
 /// Expand a query for prefix matching: truncate words > min_len chars and add '*'.
 /// Returns None if query uses FTS5 operators or no words were expanded.
+/// Check if haystack contains needle case-insensitively without allocating.
+fn contains_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+}
+
 pub(crate) fn expand_query_for_prefix(query: &str) -> Option<String> {
     // Don't mangle queries with explicit FTS5 syntax
     if query.contains('"') || query.contains('*') || query.contains('(')
@@ -84,23 +89,26 @@ pub(crate) fn expand_query_for_prefix(query: &str) -> Option<String> {
     {
         return None;
     }
-    let upper = query.to_uppercase();
-    if upper.contains(" AND ") || upper.contains(" OR ") || upper.contains(" NOT ")
-        || upper.contains("NEAR")
+    let bytes = query.as_bytes();
+    if contains_ci(bytes, b" AND ") || contains_ci(bytes, b" OR ") || contains_ci(bytes, b" NOT ")
+        || contains_ci(bytes, b"NEAR")
     {
         return None;
     }
 
-    let terms: Vec<String> = query.split_whitespace().map(|w| {
-        if w.chars().count() > PREFIX_MIN_LEN {
-            let prefix: String = w.chars().take(PREFIX_MIN_LEN).collect();
-            format!("{}*", prefix)
+    let mut result = String::with_capacity(query.len() + 8);
+    let mut has_prefix = false;
+    for word in query.split_whitespace() {
+        if !result.is_empty() { result.push(' '); }
+        if word.chars().count() > PREFIX_MIN_LEN {
+            result.extend(word.chars().take(PREFIX_MIN_LEN));
+            result.push('*');
+            has_prefix = true;
         } else {
-            w.to_string()
+            result.push_str(word);
         }
-    }).collect();
-
-    if terms.iter().any(|t| t.ends_with('*')) { Some(terms.join(" ")) } else { None }
+    }
+    if has_prefix { Some(result) } else { None }
 }
 
 pub(crate) const SCHEMA: &str = "
