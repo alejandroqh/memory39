@@ -66,6 +66,9 @@ pub struct Chunk {
     pub text: String,
 }
 
+/// Max characters per chunk (~2000 tokens). Prevents overwhelming the LLM with long monologues.
+const MAX_CHUNK_CHARS: usize = 8000;
+
 pub fn split_chunks(conversation: &str) -> Vec<Chunk> {
     let lines: Vec<&str> = conversation.lines().collect();
     if lines.is_empty() {
@@ -90,19 +93,27 @@ pub fn split_chunks(conversation: &str) -> Vec<Chunk> {
 
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut chunk_lines: Vec<&str> = Vec::new();
+    let mut chunk_chars: usize = 0;
     let mut prev_actor: Option<&str> = None;
     let mut actor_switches = 0;
 
     for (actor, line) in &tagged {
+        let line_len = line.len() + 1; // +1 for newline
+        let would_exceed = chunk_chars + line_len > MAX_CHUNK_CHARS && !chunk_lines.is_empty();
+
         if *actor != prev_actor && prev_actor.is_some() {
             actor_switches += 1;
-            if actor_switches >= 2 {
-                chunks.push(Chunk { index: chunks.len(), text: chunk_lines.join("\n") });
-                chunk_lines.clear();
-                actor_switches = 0;
-            }
         }
+
+        if actor_switches >= 2 || would_exceed {
+            chunks.push(Chunk { index: chunks.len(), text: chunk_lines.join("\n") });
+            chunk_lines.clear();
+            chunk_chars = 0;
+            actor_switches = 0;
+        }
+
         chunk_lines.push(line);
+        chunk_chars += line_len;
         prev_actor = *actor;
     }
     if !chunk_lines.is_empty() {
@@ -219,7 +230,7 @@ pub enum MemoryAction {
     Recall { query: String },
     Event { event: String, date: Option<String>, time: Option<String>, note: Option<String>, tags: Option<String>, importance: u8, emotion: Option<String>, location: Option<String>, people: Option<String>, source: Option<String> },
     Thing { thing: String, desc: Option<String>, category: Option<String>, tags: Option<String>, importance: u8, emotion: Option<String>, source: Option<String>, confidence: u8, related: Option<String> },
-    Person { name: String, role: Option<String>, relationship: Option<String>, note: Option<String>, tags: Option<String>, importance: u8, emotion: Option<String> },
+    Person { name: String, role: Option<String>, relationship: Option<String>, contact: Option<String>, met_at: Option<String>, last_seen: Option<String>, note: Option<String>, tags: Option<String>, importance: u8, emotion: Option<String> },
     Place { name: String, desc: Option<String>, address: Option<String>, kind: Option<String>, note: Option<String>, tags: Option<String>, importance: u8, emotion: Option<String> },
     Alter { id: String, fields: Vec<(String, String)> },
     Forget { id: String },
@@ -299,8 +310,11 @@ fn memory_tools() -> Vec<Tool> {
                         "name": { "type": "string", "description": "Person's name" },
                         "role": { "type": "string", "description": "Role or title" },
                         "relationship": { "type": "string", "description": "Relationship: friend, colleague, family, pet, etc." },
+                        "contact": { "type": "string", "description": "Contact info: email, phone, handle" },
+                        "met_at": { "type": "string", "description": "Where or when you met them" },
+                        "last_seen": { "type": "string", "description": "Last interaction date YYYY-MM-DD" },
                         "note": { "type": "string", "description": "Key detail about this person" },
-                        "tags": { "type": "string" },
+                        "tags": { "type": "string", "description": "Comma-separated keywords" },
                         "importance": { "type": "integer", "minimum": 0, "maximum": 10 },
                         "emotion": { "type": "string" }
                     },
@@ -369,29 +383,63 @@ fn memory_tools() -> Vec<Tool> {
 
 // --- System prompt ---
 
-const SYSTEM_PROMPT: &str = r#"You are a memory management agent. Given a conversation chunk, you must decide what facts are worth remembering.
+const SYSTEM_PROMPT: &str = r#"You are a memory management agent. Given a conversation chunk, extract facts worth remembering long-term.
 
-Your workflow for EACH fact you identify:
+## Workflow
+
+For EACH fact you identify:
 1. FIRST call recall() to check if it already exists in memory
-2. If it exists and info changed → call alter() to update it
-3. If it exists and info is wrong → call forget() then store new
-4. If it does NOT exist → call event(), thing(), person(), or place() to store it
+   - For persons: search by name (e.g. recall("Alice"))
+   - For events: search by key terms + date (e.g. recall("meeting 2025-03"))
+   - For things/places: search by core concept (e.g. recall("Python"))
+2. If recall finds a match with updated info → call alter() to update it
+3. If recall finds a match with wrong info → call forget() then store the corrected version
+4. If no match exists → call event(), thing(), person(), or place() to store it
 
-Guidelines:
-- Only store facts explicitly stated or strongly implied by the user
-- Skip greetings, filler, and small talk unless they reveal a fact
-- importance: 1-3 trivial, 4-6 normal, 7-8 significant, 9-10 critical
-- confidence (things only): 0=guess, 10=absolute fact
-- Keep fields under 200 chars
-- Tags are comma-separated keywords
+## Memory type decision tree
+
+- Does the fact have a WHEN (date, time, temporal context)?
+  → YES: event (with date if known, undated if vague like "last year")
+  → NO: continue below
+- Is the fact primarily ABOUT A PERSON (name, role, relationship, trait)?
+  → YES: person (store attributes like role, contact, relationship as person fields)
+  → NO: continue below
+- Is the fact primarily ABOUT A LOCATION (city, building, venue)?
+  → YES: place
+  → NO: thing (facts, preferences, skills, knowledge, attributes)
+
+Edge cases:
+- "Alice joined our team in March" → event (temporal) WITH people="Alice"
+- "Alice is a backend engineer" → person (attribute of Alice)
+- "The office is on 5th Ave" → place
+- "We use Python for the backend" → thing (technical fact)
+- "I prefer dark mode" → thing (preference, category="preference")
+
+## Importance scale
+
+- 1-2: Trivia — offhand remarks, small talk that reveals no actionable fact
+- 3-4: Context — background details, mild preferences ("I have a cat")
+- 5-6: Factual — job, skills, tools, team, general knowledge ("works at Acme Corp")
+- 7-8: Actionable — facts that affect decisions or interactions ("has nut allergy", "deadline is Friday")
+- 9-10: Critical — safety, emergencies, key life events ("emergency contact is Bob")
+
+Emotional weight bumps importance +1-2 (strong frustration, excitement, fear).
+
+## Confidence (things only)
+
+- 0-3: Guess or weak inference
+- 4-6: Likely but not explicitly stated
+- 7-8: Clearly stated by the user
+- 9-10: Absolute fact with evidence
+
+## Rules
+
+- Only store facts explicitly stated or strongly implied — skip filler, greetings, small talk
+- Store negative facts too ("doesn't drink coffee", "no allergies") — they inform decisions
+- Keep fields under 200 chars; use note for overflow
+- Tags are comma-separated keywords — use them to link related memories (e.g. tag a person and their project with the same tag)
 - Dates in YYYY-MM-DD format
 - source: "conversation" for all facts from this conversation
-
-Use the right memory type:
-- event: something that happened or will happen (has temporal aspect)
-- thing: a fact, preference, knowledge, or attribute
-- person: information about a specific person (name, role, relationship)
-- place: information about a location
 "#;
 
 // --- Agent loop ---
@@ -492,6 +540,8 @@ async fn process_chunk(
                     actions.push(MemoryAction::Person {
                         name: args["name"].as_str().unwrap_or("").into(),
                         role: opt_str(&args, "role"), relationship: opt_str(&args, "relationship"),
+                        contact: opt_str(&args, "contact"), met_at: opt_str(&args, "met_at"),
+                        last_seen: opt_str(&args, "last_seen"),
                         note: opt_str(&args, "note"), tags: opt_str(&args, "tags"),
                         importance: opt_u8(&args, "importance", 5), emotion: opt_str(&args, "emotion"),
                     });

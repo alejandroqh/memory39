@@ -19,17 +19,18 @@ impl Memory39 {
     description = "Temporal-priority memory system for AI agents"
 )]
 impl Memory39 {
-    /// Search across all memories with temporal-priority scoring.
+    /// Search across all memories with temporal-priority scoring (0.4×relevance + 0.3×importance + 0.3×recency).
     /// Use "*" or empty string to retrieve all memories (supports pagination via offset).
+    /// Note: date filters (from/to) restrict results to events only — persons, places, and things are excluded when date range is set.
     #[tool]
     async fn recall(
         &self,
         #[description("Search query (FTS5 syntax supported). Use '*' to list all memories")] query: String,
         #[description("Max results to return (default 10, max 100)")] limit: Option<u64>,
         #[description("Minimum importance 0-10")] min_importance: Option<u8>,
-        #[description("Date range start YYYY-MM-DD")] from: Option<String>,
-        #[description("Date range end YYYY-MM-DD")] to: Option<String>,
-        #[description("Filter by kind: event, undated, thing, person, place")] kind: Option<String>,
+        #[description("Date range start YYYY-MM-DD. Note: restricts results to events only")] from: Option<String>,
+        #[description("Date range end YYYY-MM-DD. Note: restricts results to events only")] to: Option<String>,
+        #[description("Filter by kind: event (dated E#), undated (U#), events (both E#+U#), thing, person, place")] kind: Option<String>,
         #[description("Filter by source: experienced, told, read, observed")] source: Option<String>,
         #[description("Skip first N results (for pagination, default 0)")] offset: Option<u64>,
     ) -> McpResult<String> {
@@ -150,7 +151,7 @@ impl Memory39 {
         #[description("Role or title")] role: Option<String>,
         #[description("Relationship: friend, colleague, family, etc.")] relationship: Option<String>,
         #[description("Contact info: email, phone, handle")] contact: Option<String>,
-        #[description("Where you met or know them from")] met_at: Option<String>,
+        #[description("Where or when you met them")] met_at: Option<String>,
         #[description("Last interaction date YYYY-MM-DD")] last_seen: Option<String>,
         #[description("Additional note")] note: Option<String>,
         #[description("Comma-separated tags")] tags: Option<String>,
@@ -233,7 +234,7 @@ impl Memory39 {
     async fn alter(
         &self,
         #[description("Memory ID to modify (e.g. E3, U1, T2, P1, L4)")] id: String,
-        #[description("New event/thing text")] event: Option<String>,
+        #[description("New primary text (event text for E/U, thing text for T, name for P/L)")] text: Option<String>,
         #[description("New note")] note: Option<String>,
         #[description("New tags")] tags: Option<String>,
         #[description("New importance 0-10")] importance: Option<u8>,
@@ -245,8 +246,14 @@ impl Memory39 {
         #[description("New time HH:MM (dated events only, requires date)")] time: Option<String>,
     ) -> McpResult<String> {
         let mut changes: Vec<(String, String)> = Vec::new();
-        if let Some(v) = event {
-            changes.push(("event".into(), v));
+        if let Some(v) = text {
+            let field = match id.chars().next() {
+                Some('E') | Some('U') => "event",
+                Some('T') => "thing",
+                Some('P') | Some('L') => "name",
+                _ => "event",
+            };
+            changes.push((field.into(), v));
         }
         if let Some(v) = note {
             changes.push(("note".into(), v));
@@ -273,7 +280,7 @@ impl Memory39 {
             let t = time.as_deref().unwrap_or("00:00");
             changes.push(("datetime".into(), format!("{} {}", d, t)));
         } else if time.is_some() {
-            return Ok("Cannot set time without date. Provide both --date and --time.".into());
+            return Err(McpError::invalid_params("Cannot set time without date. Provide both date and time together."));
         }
         if changes.is_empty() {
             return Ok("Nothing to alter. Provide at least one field to change.".into());
@@ -289,13 +296,16 @@ impl Memory39 {
     }
 
     /// Find connections between 2-3 concepts across all memories.
-    /// Uses 3-phase discovery: direct matches, shared attributes, and bridge connections.
+    /// Uses 3-phase discovery: (1) direct — all concepts in one memory,
+    /// (2) shared — concepts in different memories linked by a common field value (tags, location, people),
+    /// (3) bridge — one-hop connections through shared field values.
+    /// If timeout expires, returns partial results from completed phases.
     #[tool]
     async fn connect(
         &self,
-        #[description("Concepts to connect (provide 2-3 as a JSON array)")] concepts: Vec<String>,
+        #[description("Concepts to connect, 2-3 items (e.g. [\"Alice\", \"project-x\"] or [\"Bob\", \"Alice\", \"meeting\"])")] concepts: Vec<String>,
         #[description("Minimum importance 0-10")] min_importance: Option<u8>,
-        #[description("Timeout in milliseconds (default 2000)")] timeout_ms: Option<u64>,
+        #[description("Timeout in milliseconds (default 2000). Returns partial results if exceeded")] timeout_ms: Option<u64>,
     ) -> McpResult<String> {
         if concepts.len() < 2 || concepts.len() > 3 {
             return Err(McpError::invalid_params("Provide 2 or 3 concepts"));

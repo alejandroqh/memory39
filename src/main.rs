@@ -192,7 +192,7 @@ enum Command {
         /// Filter by date range end (YYYY-MM-DD)
         #[arg(long)]
         to: Option<String>,
-        /// Filter by memory kind: event, undated, thing, person, place
+        /// Filter by kind: event (dated E#), undated (U#), events (both), thing, person, place
         #[arg(long)]
         kind: Option<String>,
         /// Filter by source: experienced, told, read, observed
@@ -330,8 +330,8 @@ async fn main() {
                         println!("[{}] thing: {}", mid, thing);
                         stored += 1;
                     }
-                    llm::MemoryAction::Person { name, role, relationship, note, tags, importance, emotion } => {
-                        let id = db::insert_person(&conn, name, role.as_deref(), relationship.as_deref(), None, None, None, note.as_deref(), tags.as_deref(), *importance, emotion.as_deref(), &created_at).expect("failed to store");
+                    llm::MemoryAction::Person { name, role, relationship, contact, met_at, last_seen, note, tags, importance, emotion } => {
+                        let id = db::insert_person(&conn, name, role.as_deref(), relationship.as_deref(), contact.as_deref(), met_at.as_deref(), last_seen.as_deref(), note.as_deref(), tags.as_deref(), *importance, emotion.as_deref(), &created_at).expect("failed to store");
                         let mid = format!("P{}", id);
                         println!("[{}] person: {}", mid, name);
                         stored += 1;
