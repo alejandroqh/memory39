@@ -209,8 +209,8 @@ impl MemoryDb {
 
     // --- Delegate: connect ---
 
-    pub fn find_connections(&self, concepts: &[String], min_importance: Option<u8>, timeout: std::time::Duration) -> ConnectionResult {
-        connect::find_connections(&self.conn, concepts, min_importance, timeout)
+    pub fn find_connections(&self, concepts: &[String], min_importance: Option<u8>, limit: Option<usize>, timeout: std::time::Duration) -> ConnectionResult {
+        connect::find_connections(&self.conn, concepts, min_importance, limit.unwrap_or(connect::DEFAULT_CONNECT_LIMIT), timeout)
     }
 
     // --- Delegate: insert with bloom update ---

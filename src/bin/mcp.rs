@@ -298,6 +298,7 @@ impl Memory39 {
         #[description("Concepts to connect, 2-3 items (e.g. [\"Alice\", \"project-x\"] or [\"Bob\", \"Alice\", \"meeting\"])")] concepts: Vec<String>,
         #[description("Minimum importance 0-10")] min_importance: Option<u8>,
         #[description("Timeout in milliseconds (default 2000). Returns partial results if exceeded")] timeout_ms: Option<u64>,
+        #[description("Maximum connections to return (default 30)")] limit: Option<usize>,
     ) -> McpResult<String> {
         if concepts.len() < 2 || concepts.len() > 3 {
             return Err(McpError::invalid_params("Provide 2 or 3 concepts"));
@@ -305,7 +306,7 @@ impl Memory39 {
         let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(2000));
         let result = {
             let mdb = self.lock_db()?;
-            mdb.find_connections(&concepts, min_importance, timeout)
+            mdb.find_connections(&concepts, min_importance, limit, timeout)
         };
 
         if result.connections.is_empty() {

@@ -212,6 +212,9 @@ enum Command {
         /// Timeout in milliseconds
         #[arg(long, default_value = "2000")]
         timeout: u64,
+        /// Maximum connections to return
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Store a place (spatial memory about a location)
     Place {
@@ -495,13 +498,13 @@ async fn main() {
                 }
             }
         }
-        Command::Connect { concepts, min, timeout } => {
+        Command::Connect { concepts, min, timeout, limit } => {
             if concepts.len() < 2 || concepts.len() > 3 {
                 eprintln!("Error: provide 2 or 3 concepts");
                 std::process::exit(1);
             }
             let timeout_dur = std::time::Duration::from_millis(timeout);
-            let result = db.find_connections(&concepts, min, timeout_dur);
+            let result = db.find_connections(&concepts, min, limit, timeout_dur);
             let elapsed = result.elapsed_ms;
 
             if result.connections.is_empty() {

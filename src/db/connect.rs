@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 use super::crud::memory_id;
 use super::schema::expand_query_for_prefix;
 
-const LINKABLE_FIELDS: &[&str] = &["tags", "emotion", "location", "people"];
+const LINKABLE_FIELDS: &[&str] = &["tags", "emotion", "location", "people", "related"];
+pub const DEFAULT_CONNECT_LIMIT: usize = 30;
 
 pub enum ConnectionKind {
     Direct { mid: String },
@@ -40,6 +41,7 @@ pub fn find_connections(
     conn: &rusqlite::Connection,
     concepts: &[String],
     min_importance: Option<u8>,
+    limit: usize,
     timeout: Duration,
 ) -> ConnectionResult {
     let start = Instant::now();
@@ -65,7 +67,8 @@ pub fn find_connections(
         }
     }
 
-    if start.elapsed() >= timeout {
+    if connections.len() >= limit || start.elapsed() >= timeout {
+        connections.truncate(limit);
         return ConnectionResult { connections, elapsed_ms: start.elapsed().as_millis() };
     }
 
@@ -91,13 +94,15 @@ pub fn find_connections(
 
     phase_shared(&concept_rows, &mut connections, &mut seen);
 
-    if start.elapsed() >= timeout {
+    if connections.len() >= limit || start.elapsed() >= timeout {
+        connections.truncate(limit);
         return ConnectionResult { connections, elapsed_ms: start.elapsed().as_millis() };
     }
 
     // Phase 3: Bridge - one-hop through field values
     phase_bridge(conn, &concept_rows, min_importance, timeout, start, &mut connections, &mut seen);
 
+    connections.truncate(limit);
     ConnectionResult { connections, elapsed_ms: start.elapsed().as_millis() }
 }
 
@@ -312,7 +317,7 @@ fn search_mem_rows(
 
     // Non-event tables: things, persons, places
     for (table, fts, prefix, linkable_fields) in &[
-        ("things", "things_fts", "T", &["tags", "emotion"][..]),
+        ("things", "things_fts", "T", &["tags", "emotion", "related"][..]),
         ("persons", "persons_fts", "P", &["tags", "emotion"][..]),
         ("places", "places_fts", "L", &["tags", "emotion"][..]),
     ] {
@@ -379,19 +384,15 @@ fn phase_shared(
                 for row_b in &concept_rows[j] {
                     if row_a.mid == row_b.mid { continue; }
 
-                    let pair_key = if row_a.mid < row_b.mid {
-                        format!("{}+{}", row_a.mid, row_b.mid)
-                    } else {
-                        format!("{}+{}", row_b.mid, row_a.mid)
-                    };
-                    if seen.contains(&pair_key) { continue; }
+                    let pk = pair_key(&row_a.mid, &row_b.mid);
+                    if seen.contains(&pk) { continue; }
 
                     for field in LINKABLE_FIELDS {
                         let field_s = field.to_string();
                         if let (Some(va), Some(vb)) = (row_a.fields.get(&field_s), row_b.fields.get(&field_s)) {
                             let overlap = find_overlap(va, vb);
                             if let Some(shared_val) = overlap {
-                                seen.insert(pair_key.clone());
+                                seen.insert(pk.clone());
                                 let avg_imp = (row_a.importance + row_b.importance) as f64 / 20.0;
                                 connections.push(Connection_ {
                                     kind: ConnectionKind::Shared {
@@ -424,49 +425,53 @@ fn phase_bridge(
 ) {
     if concept_rows.len() < 2 { return; }
 
-    let rows_a = &concept_rows[0];
-    let rows_b_mids: HashSet<String> = concept_rows[1].iter().map(|r| r.mid.clone()).collect();
+    for i in 0..concept_rows.len() {
+        for j in (i + 1)..concept_rows.len() {
+            let rows_a = &concept_rows[i];
+            let rows_b_mids: HashSet<String> = concept_rows[j].iter().map(|r| r.mid.clone()).collect();
 
-    for row_a in rows_a {
-        if start.elapsed() >= timeout { return; }
+            for row_a in rows_a {
+                if start.elapsed() >= timeout { return; }
 
-        for field in LINKABLE_FIELDS {
-            let field_s = field.to_string();
-            if let Some(val) = row_a.fields.get(&field_s) {
-                for token in val.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                    if start.elapsed() >= timeout { return; }
+                for field in LINKABLE_FIELDS {
+                    let field_s = field.to_string();
+                    if let Some(val) = row_a.fields.get(&field_s) {
+                        for token in val.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                            if start.elapsed() >= timeout { return; }
 
-                    let escaped = format!("\"{}\"", token.replace('"', "\"\""));
-                    let bridge_rows = search_mem_rows(conn, &escaped, min_importance);
+                            let escaped = format!("\"{}\"", token.replace('"', "\"\""));
+                            let bridge_rows = search_mem_rows(conn, &escaped, min_importance);
 
-                    for bridge in &bridge_rows {
-                        if bridge.mid == row_a.mid { continue; }
-                        if !rows_b_mids.contains(&bridge.mid) { continue; }
+                            for bridge in &bridge_rows {
+                                if bridge.mid == row_a.mid { continue; }
+                                if !rows_b_mids.contains(&bridge.mid) { continue; }
 
-                        let pair_key = if row_a.mid < bridge.mid {
-                            format!("{}~{}", row_a.mid, bridge.mid)
-                        } else {
-                            format!("{}~{}", bridge.mid, row_a.mid)
-                        };
-                        if seen.contains(&pair_key) { continue; }
-                        seen.insert(pair_key);
+                                let pair_key = pair_key(&row_a.mid, &bridge.mid);
+                                if seen.contains(&pair_key) { continue; }
+                                seen.insert(pair_key);
 
-                        let avg_imp = (row_a.importance + bridge.importance) as f64 / 20.0;
-                        connections.push(Connection_ {
-                            kind: ConnectionKind::Bridge {
-                                mid_a: row_a.mid.clone(),
-                                mid_b: bridge.mid.clone(),
-                                via_field: field_s.clone(),
-                                via_value: token.to_string(),
-                            },
-                            score: 0.5 * avg_imp.max(0.3),
-                            fields: Vec::new(),
-                        });
+                                let avg_imp = (row_a.importance + bridge.importance) as f64 / 20.0;
+                                connections.push(Connection_ {
+                                    kind: ConnectionKind::Bridge {
+                                        mid_a: row_a.mid.clone(),
+                                        mid_b: bridge.mid.clone(),
+                                        via_field: field_s.clone(),
+                                        via_value: token.to_string(),
+                                    },
+                                    score: 0.5 * avg_imp.max(0.3),
+                                    fields: Vec::new(),
+                                });
+                            }
+                        }
                     }
                 }
             }
         }
     }
+}
+
+fn pair_key(a: &str, b: &str) -> String {
+    if a < b { format!("{}+{}", a, b) } else { format!("{}+{}", b, a) }
 }
 
 /// Find overlap between two comma-separated value strings.
