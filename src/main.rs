@@ -43,14 +43,14 @@ enum Command {
         #[arg(long)]
         timestamp: Option<String>,
     },
-    /// Remember an event (something that happened)
+    /// Store an event (something that happened or will happen). Omit date for undated events
     Event {
         /// What happened (max 255 chars)
         event: String,
         /// Date in ISO 8601 format (YYYY-MM-DD). Omit for undated event
         #[arg(long)]
         date: Option<String>,
-        /// Time in HH:MM format. Defaults to now
+        /// Time in HH:MM format (default 00:00)
         #[arg(long)]
         time: Option<String>,
         /// Additional note (max 255 chars)
@@ -75,7 +75,7 @@ enum Command {
         #[arg(long)]
         source: Option<String>,
     },
-    /// Remember a thing (something that exists)
+    /// Store a thing (an object, concept, or fact worth remembering)
     Thing {
         /// What to remember (max 255 chars)
         thing: String,
@@ -104,7 +104,7 @@ enum Command {
         #[arg(long)]
         related: Option<String>,
     },
-    /// Remember a person (social memory)
+    /// Store a person memory (social memory about someone)
     Person {
         /// Person's name (max 255 chars)
         name: String,
@@ -117,7 +117,7 @@ enum Command {
         /// Contact info: email, phone, handle (max 255 chars)
         #[arg(long)]
         contact: Option<String>,
-        /// Where you met or know them from (max 255 chars)
+        /// Where or when you met them (max 255 chars)
         #[arg(long)]
         met_at: Option<String>,
         /// Last time you interacted (YYYY-MM-DD)
@@ -136,18 +136,18 @@ enum Command {
         #[arg(long, default_value = "5")]
         importance: u8,
     },
-    /// Forget a memory by its ID (e.g. E3, U1)
+    /// Forget a memory by its ID (e.g. E3, U1, T2, P1, L4)
     Forget {
         /// Memory ID to delete
         id: String,
     },
-    /// Alter a memory by its ID (e.g. E3, U1)
+    /// Alter a memory by its ID (e.g. E3, U1, T2, P1, L4). Only provide fields you want to change
     Alter {
         /// Memory ID to modify
         id: String,
-        /// New event/thing text
+        /// New primary text (event text for E/U, thing text for T, name for P/L)
         #[arg(long)]
-        event: Option<String>,
+        text: Option<String>,
         /// New note
         #[arg(long)]
         note: Option<String>,
@@ -213,7 +213,7 @@ enum Command {
         #[arg(long, default_value = "2000")]
         timeout: u64,
     },
-    /// Remember a place (spatial memory)
+    /// Store a place (spatial memory about a location)
     Place {
         /// Name of the place (max 255 chars)
         name: String,
@@ -430,7 +430,7 @@ async fn main() {
         }
         Command::Alter {
             id,
-            event,
+            text,
             note,
             tags,
             importance,
@@ -442,7 +442,15 @@ async fn main() {
             time,
         } => {
             let mut changes: Vec<(String, String)> = Vec::new();
-            if let Some(v) = event { changes.push(("event".into(), v)); }
+            if let Some(v) = text {
+                let field = match id.chars().next() {
+                    Some('E') | Some('U') => "event",
+                    Some('T') => "thing",
+                    Some('P') | Some('L') => "name",
+                    _ => "event",
+                };
+                changes.push((field.into(), v));
+            }
             if let Some(v) = note { changes.push(("note".into(), v)); }
             if let Some(v) = tags { changes.push(("tags".into(), v)); }
             if let Some(v) = importance { changes.push(("importance".into(), v.to_string())); }

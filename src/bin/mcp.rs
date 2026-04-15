@@ -71,11 +71,11 @@ impl Memory39 {
         #[description("Date in YYYY-MM-DD format. Omit for undated event")] date: Option<String>,
         #[description("Time in HH:MM format (default 00:00)")] time: Option<String>,
         #[description("Additional note (max 255 chars)")] note: Option<String>,
-        #[description("Comma-separated tags")] tags: Option<String>,
+        #[description("Comma-separated tags (max 255 chars)")] tags: Option<String>,
         #[description("Importance 0-10 (default 5)")] importance: Option<u8>,
         #[description("Emotional valence: positive, negative, neutral, or free text")] emotion: Option<String>,
-        #[description("Where it happened")] location: Option<String>,
-        #[description("Who was involved, comma-separated")] people: Option<String>,
+        #[description("Where it happened (max 255 chars)")] location: Option<String>,
+        #[description("Who was involved, comma-separated (max 255 chars)")] people: Option<String>,
         #[description("How you know: experienced, told, read, observed")] source: Option<String>,
     ) -> McpResult<String> {
         let created_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
@@ -114,14 +114,14 @@ impl Memory39 {
     async fn thing(
         &self,
         #[description("What to remember (max 255 chars)")] thing: String,
-        #[description("Description")] desc: Option<String>,
+        #[description("Description (max 255 chars)")] desc: Option<String>,
         #[description("Category (free text)")] category: Option<String>,
-        #[description("Comma-separated tags")] tags: Option<String>,
+        #[description("Comma-separated tags (max 255 chars)")] tags: Option<String>,
         #[description("Importance 0-10 (default 5)")] importance: Option<u8>,
-        #[description("Emotional valence")] emotion: Option<String>,
-        #[description("Where this knowledge came from")] source: Option<String>,
+        #[description("Emotional valence: positive, negative, neutral, or free text")] emotion: Option<String>,
+        #[description("Where this knowledge came from (max 255 chars)")] source: Option<String>,
         #[description("Certainty 0-10 (default 5)")] confidence: Option<u8>,
-        #[description("Comma-separated related concepts")] related: Option<String>,
+        #[description("Comma-separated related concepts (max 255 chars)")] related: Option<String>,
     ) -> McpResult<String> {
         let created_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
         let id = {
@@ -149,16 +149,16 @@ impl Memory39 {
     #[tool]
     async fn person(
         &self,
-        #[description("Person's name")] name: String,
-        #[description("Role or title")] role: Option<String>,
+        #[description("Person's name (max 255 chars)")] name: String,
+        #[description("Role or title (max 255 chars)")] role: Option<String>,
         #[description("Relationship: friend, colleague, family, etc.")] relationship: Option<String>,
-        #[description("Contact info: email, phone, handle")] contact: Option<String>,
-        #[description("Where or when you met them")] met_at: Option<String>,
+        #[description("Contact info: email, phone, handle (max 255 chars)")] contact: Option<String>,
+        #[description("Where or when you met them (max 255 chars)")] met_at: Option<String>,
         #[description("Last interaction date YYYY-MM-DD")] last_seen: Option<String>,
-        #[description("Additional note")] note: Option<String>,
-        #[description("Comma-separated tags")] tags: Option<String>,
+        #[description("Additional note (max 255 chars)")] note: Option<String>,
+        #[description("Comma-separated tags (max 255 chars)")] tags: Option<String>,
         #[description("Importance 0-10 (default 5)")] importance: Option<u8>,
-        #[description("Emotional valence")] emotion: Option<String>,
+        #[description("Emotional valence: positive, negative, neutral, or free text")] emotion: Option<String>,
     ) -> McpResult<String> {
         let created_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
         let id = {
@@ -187,14 +187,14 @@ impl Memory39 {
     #[tool]
     async fn place(
         &self,
-        #[description("Name of the place")] name: String,
-        #[description("Description")] desc: Option<String>,
-        #[description("Address or coordinates")] address: Option<String>,
+        #[description("Name of the place (max 255 chars)")] name: String,
+        #[description("Description (max 255 chars)")] desc: Option<String>,
+        #[description("Address or coordinates (max 255 chars)")] address: Option<String>,
         #[description("Type: city, building, room, outdoor, virtual, etc.")] kind: Option<String>,
-        #[description("Additional note")] note: Option<String>,
-        #[description("Comma-separated tags")] tags: Option<String>,
+        #[description("Additional note (max 255 chars)")] note: Option<String>,
+        #[description("Comma-separated tags (max 255 chars)")] tags: Option<String>,
         #[description("Importance 0-10 (default 5)")] importance: Option<u8>,
-        #[description("Emotional valence")] emotion: Option<String>,
+        #[description("Emotional valence: positive, negative, neutral, or free text")] emotion: Option<String>,
     ) -> McpResult<String> {
         let created_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
         let id = {
