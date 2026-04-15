@@ -1,5 +1,6 @@
 use rusqlite::{Connection, Result, params};
 
+#[allow(clippy::too_many_arguments)]
 pub fn insert_event(
     conn: &Connection,
     event: &str,
@@ -33,6 +34,7 @@ pub fn insert_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn insert_thing(
     conn: &Connection,
     thing: &str,
@@ -54,6 +56,7 @@ pub fn insert_thing(
     Ok(conn.last_insert_rowid())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn insert_person(
     conn: &Connection,
     name: &str,
@@ -76,6 +79,7 @@ pub fn insert_person(
     Ok(conn.last_insert_rowid())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn insert_place(
     conn: &Connection,
     name: &str,

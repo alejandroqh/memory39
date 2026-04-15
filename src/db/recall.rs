@@ -32,8 +32,8 @@ pub fn recall(conn: &Connection, query: &str, limit: usize, offset: usize, filte
         recall_all_inner(conn, fetch, filters)
     } else {
         let mut results = recall_inner(conn, query, fetch, filters);
-        if results.len() < fetch {
-            if let Some(expanded) = expand_query_for_prefix(query) {
+        if results.len() < fetch
+            && let Some(expanded) = expand_query_for_prefix(query) {
                 let seen: HashSet<String> = results.iter().map(|r| r.mid.clone()).collect();
                 let mut extra = recall_inner(conn, &expanded, fetch, filters);
                 extra.retain(|r| !seen.contains(&r.mid));
@@ -41,7 +41,6 @@ pub fn recall(conn: &Connection, query: &str, limit: usize, offset: usize, filte
                 results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
                 results.truncate(fetch);
             }
-        }
         results
     };
 
@@ -79,12 +78,11 @@ fn build_recall_filters(
             params.push(Box::new(to.clone()));
         }
     }
-    if include_source {
-        if let Some(ref source) = filters.source {
+    if include_source
+        && let Some(ref source) = filters.source {
             clauses.push_str(&format!(" AND lower({}.source) = lower(?{})", alias, idx_start + params.len()));
             params.push(Box::new(source.clone()));
         }
-    }
 
     (clauses, params)
 }
@@ -296,6 +294,7 @@ fn recall_event_query(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn recall_generic_query(
     conn: &Connection,
     results: &mut Vec<RecallResult>,
@@ -329,11 +328,10 @@ fn recall_generic_query(
                     if label == "Importance" { importance = v; }
                     fields.push((label.clone(), v.to_string()));
                 }
-            } else if let Ok(v) = row.get::<_, String>(col) {
-                if !v.is_empty() {
+            } else if let Ok(v) = row.get::<_, String>(col)
+                && !v.is_empty() {
                     fields.push((label.clone(), v));
                 }
-            }
         }
 
         let score = composite_score(fts_rank, importance, None, now);
@@ -421,11 +419,10 @@ fn build_event_result(row: &Row, dated: bool, now: &str) -> RecallResult {
                 importance = v;
                 fields.push((label.to_string(), v.to_string()));
             }
-        } else if let Ok(v) = row.get::<_, String>(col) {
-            if !v.is_empty() {
+        } else if let Ok(v) = row.get::<_, String>(col)
+            && !v.is_empty() {
                 fields.push((label.to_string(), v));
             }
-        }
     }
 
     let score = composite_score(fts_rank, importance, datetime.as_deref(), now);

@@ -2,6 +2,18 @@ use memory39::db;
 use std::sync::{Arc, Mutex};
 use turbomcp::prelude::*;
 
+// Compile-time check: MCP server version must match Cargo.toml
+const _: () = {
+    let cargo = env!("CARGO_PKG_VERSION").as_bytes();
+    let mcp = b"1.0.0";
+    assert!(cargo.len() == mcp.len(), "MCP server version does not match Cargo.toml — update #[server(version)] below");
+    let mut i = 0;
+    while i < cargo.len() {
+        assert!(cargo[i] == mcp[i], "MCP server version does not match Cargo.toml — update #[server(version)] below");
+        i += 1;
+    }
+};
+
 #[derive(Clone)]
 struct Memory39 {
     db: Arc<Mutex<db::MemoryDb>>,
@@ -18,6 +30,7 @@ impl Memory39 {
     version = "1.0.0",
     description = "Temporal-priority memory system for AI agents"
 )]
+#[allow(clippy::too_many_arguments)]
 impl Memory39 {
     /// Search across all memories with temporal-priority scoring (0.4×relevance + 0.3×importance + 0.3×recency).
     /// Use "*" or empty string to retrieve all memories (supports pagination via offset).
@@ -277,10 +290,10 @@ impl Memory39 {
         if changes.is_empty() {
             return Ok("Nothing to alter. Provide at least one field to change.".into());
         }
-        match {
+        let res = {
             let mut mdb = self.lock_db()?;
             mdb.alter(&id, &changes)
-        } {
+        }; match res {
             Ok(true) => Ok(format!("Altered: {}", id)),
             Ok(false) => Ok(format!("Not found: {}", id)),
             Err(e) => Err(McpError::internal(e.to_string())),

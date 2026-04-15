@@ -78,13 +78,12 @@ pub fn find_connections(
         let escaped = format!("\"{}\"", concept.replace('"', "\"\""));
         let mut rows = search_mem_rows(conn, &escaped, min_importance);
         // Prefix fallback if exact match found few rows
-        if rows.len() < 5 {
-            if let Some(expanded) = expand_query_for_prefix(concept) {
+        if rows.len() < 5
+            && let Some(expanded) = expand_query_for_prefix(concept) {
                 let seen_mids: HashSet<String> = rows.iter().map(|r| r.mid.clone()).collect();
                 let extra = search_mem_rows(conn, &expanded, min_importance);
                 rows.extend(extra.into_iter().filter(|r| !seen_mids.contains(&r.mid)));
             }
-        }
         concept_rows.push(rows);
 
         if start.elapsed() >= timeout {
@@ -118,8 +117,8 @@ fn phase_direct(
         ("events", "events_fts", "E", true),
         ("events_undated", "events_undated_fts", "U", false),
     ] {
-        let min_clause = if min_importance.is_some() {
-            format!(" AND t.importance >= {}", min_importance.unwrap())
+        let min_clause = if let Some(mi) = min_importance {
+            format!(" AND t.importance >= {}", mi)
         } else {
             String::new()
         };
@@ -190,8 +189,8 @@ fn phase_direct(
         ("persons", "persons_fts", "P", "name", "Name"),
         ("places", "places_fts", "L", "name", "Name"),
     ] {
-        let min_clause = if min_importance.is_some() {
-            format!(" AND t.importance >= {}", min_importance.unwrap())
+        let min_clause = if let Some(mi) = min_importance {
+            format!(" AND t.importance >= {}", mi)
         } else {
             String::new()
         };
@@ -251,8 +250,8 @@ fn search_mem_rows(
         ("events", "events_fts", "E", true),
         ("events_undated", "events_undated_fts", "U", false),
     ] {
-        let min_clause = if min_importance.is_some() {
-            format!(" AND t.importance >= {}", min_importance.unwrap())
+        let min_clause = if let Some(mi) = min_importance {
+            format!(" AND t.importance >= {}", mi)
         } else {
             String::new()
         };
@@ -291,17 +290,15 @@ fn search_mem_rows(
                 }
                 let imp: i64 = row.get(3).unwrap_or(5);
                 for (i, name) in ["tags", "emotion", "location", "people"].iter().enumerate() {
-                    if let Ok(v) = row.get::<_, String>(4 + i) {
-                        if !v.is_empty() { field_map.insert(name.to_string(), v); }
-                    }
+                    if let Ok(v) = row.get::<_, String>(4 + i)
+                        && !v.is_empty() { field_map.insert(name.to_string(), v); }
                 }
                 imp
             } else {
                 let imp: i64 = row.get(2).unwrap_or(5);
                 for (i, name) in ["tags", "emotion", "location", "people"].iter().enumerate() {
-                    if let Ok(v) = row.get::<_, String>(3 + i) {
-                        if !v.is_empty() { field_map.insert(name.to_string(), v); }
-                    }
+                    if let Ok(v) = row.get::<_, String>(3 + i)
+                        && !v.is_empty() { field_map.insert(name.to_string(), v); }
                 }
                 imp
             };
@@ -321,8 +318,8 @@ fn search_mem_rows(
         ("persons", "persons_fts", "P", &["tags", "emotion"][..]),
         ("places", "places_fts", "L", &["tags", "emotion"][..]),
     ] {
-        let min_clause = if min_importance.is_some() {
-            format!(" AND t.importance >= {}", min_importance.unwrap())
+        let min_clause = if let Some(mi) = min_importance {
+            format!(" AND t.importance >= {}", mi)
         } else {
             String::new()
         };
@@ -354,9 +351,8 @@ fn search_mem_rows(
 
             let imp: i64 = row.get(1).unwrap_or(5);
             for (i, name) in lf.iter().enumerate() {
-                if let Ok(v) = row.get::<_, String>(2 + i) {
-                    if !v.is_empty() { field_map.insert(name.clone(), v); }
-                }
+                if let Ok(v) = row.get::<_, String>(2 + i)
+                    && !v.is_empty() { field_map.insert(name.clone(), v); }
             }
 
             Ok(MemRow { mid, fields: field_map, importance: imp })
