@@ -321,6 +321,10 @@ GROQ_API_KEY=gsk_...
 OPENAI_API_KEY=sk-...
 ```
 
+## Built With
+
+- [TurboMCP](https://github.com/Epistates/turbomcp) - Rust MCP server framework
+
 ## License
 
-MIT
+Apache-2.0
