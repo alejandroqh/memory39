@@ -6,7 +6,7 @@ mod connect;
 use rusqlite::{Connection, Result};
 use std::path::Path;
 
-pub use crud::{insert_event, insert_thing, insert_person, insert_place, memory_id, parse_memory_id, forget, alter};
+pub use crud::{insert_event, insert_thing, insert_person, insert_place, memory_id, parse_memory_id, text_field_for_id, forget, alter};
 pub use recall::{RecallFilters, RecallResult, recall};
 pub use connect::{ConnectionKind, Connection_, ConnectionResult, find_connections};
 

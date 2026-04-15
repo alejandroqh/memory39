@@ -249,13 +249,7 @@ impl Memory39 {
     ) -> McpResult<String> {
         let mut changes: Vec<(String, String)> = Vec::new();
         if let Some(v) = text {
-            let field = match id.chars().next() {
-                Some('E') | Some('U') => "event",
-                Some('T') => "thing",
-                Some('P') | Some('L') => "name",
-                _ => "event",
-            };
-            changes.push((field.into(), v));
+            changes.push((db::text_field_for_id(&id).into(), v));
         }
         if let Some(v) = note {
             changes.push(("note".into(), v));

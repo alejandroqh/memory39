@@ -101,6 +101,17 @@ pub fn memory_id(prefix: &str, row_id: i64) -> String {
     format!("{}{}", prefix, row_id)
 }
 
+/// Maps a memory ID prefix to its primary text field name for ALTER operations.
+/// E/U → "event", T → "thing", P/L → "name"
+pub fn text_field_for_id(mid: &str) -> &'static str {
+    match mid.as_bytes().first() {
+        Some(b'E') | Some(b'U') => "event",
+        Some(b'T') => "thing",
+        Some(b'P') | Some(b'L') => "name",
+        _ => "event",
+    }
+}
+
 /// Parse a memory ID like "E3" into (prefix, row_id). Returns None if invalid.
 pub fn parse_memory_id(mid: &str) -> Option<(String, i64)> {
     if mid.is_empty() {
