@@ -6,7 +6,8 @@ ulimit -n 4096 2>/dev/null || true
 
 VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])")
 NAME="memory39"
-MCP="mcp"
+CLI_BIN="memory39-cli"
+MCP_BIN="memory39-mcp"
 OUT_DIR="dist"
 
 mkdir -p "$OUT_DIR"
@@ -28,8 +29,8 @@ build_target() {
   echo ""
   echo "--- $label ($target) ---"
   $cmd --release --target "$target"
-  cp "target/$target/release/${NAME}${suffix}" "$OUT_DIR/${NAME}-cli-${label}${suffix}"
-  cp "target/$target/release/${MCP}${suffix}"  "$OUT_DIR/${NAME}-mcp-${label}${suffix}"
+  cp "target/$target/release/${CLI_BIN}${suffix}" "$OUT_DIR/${NAME}-cli-${label}${suffix}"
+  cp "target/$target/release/${MCP_BIN}${suffix}" "$OUT_DIR/${NAME}-mcp-${label}${suffix}"
   echo "  -> $OUT_DIR/${NAME}-cli-${label}${suffix}"
   echo "  -> $OUT_DIR/${NAME}-mcp-${label}${suffix}"
 }

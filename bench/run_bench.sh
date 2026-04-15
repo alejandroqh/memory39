@@ -47,7 +47,7 @@ echo ""
 echo "--- Building memory39 ---"
 cd "$PROJECT_DIR"
 cargo build --release 2>&1 | tail -1
-MEMORY39_BIN="$PROJECT_DIR/target/release/memory39"
+MEMORY39_BIN="$PROJECT_DIR/target/release/memory39-cli"
 
 # Step 2: Clone AMB if needed
 if [ ! -d "$AMB_DIR" ]; then

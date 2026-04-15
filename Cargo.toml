@@ -29,3 +29,11 @@ turbomcp = { git = "https://github.com/Epistates/turbomcp" }
 dirs = "6"
 bloomfilter = "3"
 unicode-normalization = "0.1"
+
+[[bin]]
+name = "memory39-cli"
+path = "src/main.rs"
+
+[[bin]]
+name = "memory39-mcp"
+path = "src/bin/mcp.rs"
