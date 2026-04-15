@@ -4,6 +4,25 @@ Temporal-priority memory system for AI agents. Rust CLI + MCP server backed by S
 
 Memories are scored by **0.4 x relevance + 0.3 x importance + 0.3 x recency** (30-day half-life), so recent important matches surface first.
 
+## Performance
+
+memory39 uses a **bloom filter** as a pre-check layer before FTS5 queries. On every `recall`, the bloom filter tests whether the query tokens exist anywhere in the database - if they definitely don't, the FTS5 query is skipped entirely, returning zero results in **O(1)** with no disk I/O.
+
+| Layer | When it runs | Cost |
+|-------|-------------|------|
+| Bloom filter | Every `recall` query | ~nanoseconds, in-memory |
+| FTS5 search | Only if bloom says "maybe" | Full-text index scan |
+
+How it works:
+
+- **Unigrams + bigrams** - every memory field is tokenized into individual words and adjacent-word pairs, all stored in the bloom filter. A query for `"alice berlin"` checks both tokens and the `alice+berlin` bigram.
+- **Unicode-normalized** - tokens are lowercased with diacritics removed (matching FTS5's `unicode61 remove_diacritics 2`), so `café` and `cafe` hit the same entry.
+- **Prefix-safe** - long tokens (>6 chars) that FTS5 would prefix-expand are never skipped, avoiding false negatives.
+- **Persisted** - the bloom filter is saved to `<db>.bloom` alongside the database and loaded on startup. Rebuilt automatically after bulk `ingest` operations.
+- **Zero false negatives** - if a token exists in any memory, the bloom filter always says "maybe". It can only produce false positives (saying "maybe" when nothing matches), which just fall through to FTS5 as usual.
+
+Configured for 600K items at 0.001% false positive rate.
+
 ## Install
 
 ```bash
@@ -39,17 +58,53 @@ Every memory has `importance` (0-10), `emotion`, and `tags`. The prefix + rowid 
 
 ### Commands
 
-#### `ingest` — LLM-driven fact extraction
+#### `ingest` - LLM-driven fact extraction
 
-Reads a conversation and automatically extracts memories via tool-calling.
+Reads a conversation and uses an LLM agent loop (up to 10 tool-calling rounds per chunk) to automatically extract and store memories. The LLM decides what type each fact is (event, thing, person, place), checks for duplicates via `recall`, and uses `alter`/`forget` to keep existing memories up to date.
+
+**Input format:** plain text, passed inline or via stdin. The chunker auto-detects conversation structure by recognizing actor prefixes:
+
+| Prefix pattern | Detected as |
+|----------------|-------------|
+| `User:`, `Human:`, `Customer:` | user turn |
+| `Assistant:`, `Agent:`, `Bot:`, `AI:` | agent turn |
+| `[...] User:`, `[...] Human:` | timestamped user turn |
+| `[...] Assistant:`, `[...] Agent:` | timestamped agent turn |
+| `Speaker_A:`, `Speaker_1:` | user turn |
+| `Speaker_B:`, `Speaker_2:` | agent turn |
+
+Conversations are split into ~8K-char chunks on actor switches (every 2 switches or when size limit is reached). Plain text without actor prefixes is treated as a single chunk.
 
 ```bash
-# From stdin
+# From stdin (any text format)
 cat conversation.txt | memory39-cli ingest -
 
 # Inline
 memory39-cli ingest "Alice said she's moving to Berlin in March"
+
+# Chat logs, transcripts, meeting notes - all work
+cat slack_export.txt | memory39-cli ingest - --llm groq
 ```
+
+**What gets extracted:**
+
+| Memory type | Stored when the fact has... | Example |
+|-------------|----------------------------|---------|
+| Event (dated) | A specific date or time | "Alice joined the team in March" |
+| Event (undated) | Temporal context but no date | "They met last year at a conference" |
+| Person | Attributes about someone | "Alice is a backend engineer" |
+| Place | A location | "The office is on 5th Ave" |
+| Thing | Knowledge, preferences, facts | "We use Python for the backend" |
+
+**Importance scale assigned by the LLM:**
+
+| Range | Level | Example |
+|-------|-------|---------|
+| 1-2 | Trivia | Offhand remarks, small talk |
+| 3-4 | Context | Background details, mild preferences |
+| 5-6 | Factual | Job, skills, tools, team info |
+| 7-8 | Actionable | Allergies, deadlines, decisions |
+| 9-10 | Critical | Emergencies, key life events |
 
 | Flag | Description |
 |------|-------------|
@@ -65,7 +120,7 @@ memory39-cli ingest "Alice said she's moving to Berlin in March"
 | `openai` | `gpt-4o-mini` | `OPENAI_API_KEY` |
 | `ollama` | `llama3.2` | none (local) |
 
-#### `event` — Store an event
+#### `event` - Store an event
 
 ```bash
 memory39-cli event "Had coffee with Alice" --date 2025-03-15 --people Alice --tags coffee,social
@@ -74,7 +129,7 @@ memory39-cli event "Had coffee with Alice" --date 2025-03-15 --people Alice --ta
 | Arg/Flag | Required | Description |
 |----------|----------|-------------|
 | `<event>` | yes | What happened (max 255 chars) |
-| `--date` | no | `YYYY-MM-DD` — omit for undated |
+| `--date` | no | `YYYY-MM-DD` - omit for undated |
 | `--time` | no | `HH:MM` (default `00:00`) |
 | `--note` | no | Additional note |
 | `--tags` | no | Comma-separated tags |
@@ -84,7 +139,7 @@ memory39-cli event "Had coffee with Alice" --date 2025-03-15 --people Alice --ta
 | `--people` | no | Comma-separated names |
 | `--source` | no | `experienced`, `told`, `read`, `observed` |
 
-#### `thing` — Store a fact or concept
+#### `thing` - Store a fact or concept
 
 ```bash
 memory39-cli thing "Rust edition 2024 requires rustc 1.85+" --category programming --confidence 9
@@ -102,7 +157,7 @@ memory39-cli thing "Rust edition 2024 requires rustc 1.85+" --category programmi
 | `--confidence` | no | Certainty 0-10 (default 5) |
 | `--related` | no | Comma-separated related concepts |
 
-#### `person` — Store a social memory
+#### `person` - Store a social memory
 
 ```bash
 memory39-cli person "Alice" --role "ML engineer" --relationship colleague --met-at "KubeCon 2024"
@@ -121,7 +176,7 @@ memory39-cli person "Alice" --role "ML engineer" --relationship colleague --met-
 | `--importance` | no | 0-10 (default 5) |
 | `--emotion` | no | Emotional valence |
 
-#### `place` — Store a spatial memory
+#### `place` - Store a spatial memory
 
 ```bash
 memory39-cli place "Blue Bottle Coffee" --address "123 Main St, SF" --kind building --tags coffee,work
@@ -138,7 +193,7 @@ memory39-cli place "Blue Bottle Coffee" --address "123 Main St, SF" --kind build
 | `--importance` | no | 0-10 (default 5) |
 | `--emotion` | no | Emotional valence |
 
-#### `recall` — Search memories
+#### `recall` - Search memories
 
 ```bash
 memory39-cli recall "coffee" --limit 5 --min 3 --kind event
@@ -156,7 +211,7 @@ memory39-cli recall "*"  # list all
 | `--source` | no | `experienced`, `told`, `read`, `observed` |
 | `--offset` | no | Skip first N results (default 0) |
 
-#### `connect` — Find connections between concepts
+#### `connect` - Find connections between concepts
 
 ```bash
 memory39-cli connect Alice Berlin meeting
@@ -168,15 +223,15 @@ memory39-cli connect Alice Berlin meeting
 | `--min` | no | Minimum importance 0-10 |
 | `--timeout` | no | Timeout in ms (default 2000) |
 
-Three-phase discovery: **(1) direct** — all concepts in one memory, **(2) shared** — concepts in separate memories linked by a common field, **(3) bridge** — one-hop connections through shared field values.
+Three-phase discovery: **(1) direct** - all concepts in one memory, **(2) shared** - concepts in separate memories linked by a common field, **(3) bridge** - one-hop connections through shared field values.
 
-#### `forget` — Delete a memory
+#### `forget` - Delete a memory
 
 ```bash
 memory39-cli forget E3
 ```
 
-#### `alter` — Modify a memory
+#### `alter` - Modify a memory
 
 ```bash
 memory39-cli alter T2 --text "Updated fact" --importance 8
@@ -199,7 +254,7 @@ memory39-cli alter T2 --text "Updated fact" --importance 8
 
 ## MCP Server
 
-`memory39-mcp` exposes all database tools over MCP (STDIO transport). The `ingest` command is excluded — only direct operations are available.
+`memory39-mcp` exposes all database tools over MCP (STDIO transport). The `ingest` command is excluded - only direct operations are available.
 
 Database path: `~/.memory39/memory39.db` (auto-created).
 
