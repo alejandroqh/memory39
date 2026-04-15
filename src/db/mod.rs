@@ -2,15 +2,17 @@ mod schema;
 mod crud;
 mod recall;
 mod connect;
+mod bloom;
 
 use rusqlite::{Connection, Result};
 use std::path::Path;
 
+pub use bloom::MemoryDb;
 pub use crud::{insert_event, insert_thing, insert_person, insert_place, memory_id, parse_memory_id, text_field_for_id, forget, alter};
 pub use recall::{RecallFilters, RecallResult, recall};
 pub use connect::{ConnectionKind, Connection_, ConnectionResult, find_connections};
 
-pub fn open(path: &Path) -> Result<Connection> {
+fn open_conn(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
 
     conn.execute_batch("
@@ -27,7 +29,12 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-pub fn open_ram() -> Result<Connection> {
+pub fn open(path: &Path) -> Result<MemoryDb> {
+    let conn = open_conn(path)?;
+    Ok(MemoryDb::new(conn, Some(path)))
+}
+
+pub fn open_ram() -> Result<MemoryDb> {
     let conn = Connection::open_in_memory()?;
     conn.execute_batch("
         PRAGMA synchronous = OFF;
@@ -35,15 +42,22 @@ pub fn open_ram() -> Result<Connection> {
         PRAGMA temp_store = MEMORY;
     ")?;
     conn.execute_batch(schema::SCHEMA)?;
-    Ok(conn)
+    Ok(MemoryDb::new_ram(conn))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn test_db() -> Connection {
-        open_ram().expect("failed to create test db")
+    fn test_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("
+            PRAGMA synchronous = OFF;
+            PRAGMA cache_size = -16000;
+            PRAGMA temp_store = MEMORY;
+        ").unwrap();
+        conn.execute_batch(schema::SCHEMA).unwrap();
+        conn
     }
 
     fn ts() -> String {
@@ -129,9 +143,9 @@ mod tests {
 
     #[test]
     fn test_migration_idempotent() {
-        let conn = open_ram().unwrap();
-        schema::migrate_fts_tokenizer(&conn).unwrap();
-        insert_event(&conn, "test event", None, None, None, 5, None, None, None, None, &ts()).unwrap();
+        let mdb = open_ram().unwrap();
+        schema::migrate_fts_tokenizer(mdb.conn()).unwrap();
+        insert_event(mdb.conn(), "test event", None, None, None, 5, None, None, None, None, &ts()).unwrap();
     }
 
     #[test]

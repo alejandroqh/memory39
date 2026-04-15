@@ -245,7 +245,7 @@ enum Command {
 async fn main() {
     llm::load_dotenv();
     let cli = Cli::parse();
-    let conn = if cli.ram {
+    let mut db = if cli.ram {
         db::open_ram().expect("failed to open in-memory database")
     } else {
         db::open(&cli.db).expect("failed to open database")
@@ -273,6 +273,7 @@ async fn main() {
 
             eprintln!("Memory agent via {} ({})...", cli.llm, config.model);
 
+            let conn = db.conn();
             let recall_fn = |query: &str| -> String {
                 let filters = db::RecallFilters {
                     min_importance: None,
@@ -281,7 +282,7 @@ async fn main() {
                     memory_type: None,
                     source: None,
                 };
-                let results = db::recall(&conn, query, 5, 0, &filters);
+                let results = db::recall(conn, query, 5, 0, &filters);
                 if results.is_empty() {
                     "No existing memories found.".into()
                 } else {
@@ -320,38 +321,38 @@ async fn main() {
                             let t = time.as_deref().unwrap_or("00:00");
                             format!("{} {}", d, t)
                         });
-                        let id = db::insert_event(&conn, event, datetime.as_deref(), note.as_deref(), tags.as_deref(), *importance, emotion.as_deref(), location.as_deref(), people.as_deref(), source.as_deref(), &created_at).expect("failed to store");
+                        let id = db::insert_event(conn, event, datetime.as_deref(), note.as_deref(), tags.as_deref(), *importance, emotion.as_deref(), location.as_deref(), people.as_deref(), source.as_deref(), &created_at).expect("failed to store");
                         let mid = if datetime.is_some() { format!("E{}", id) } else { format!("U{}", id) };
                         println!("[{}] event: {}", mid, event);
                         stored += 1;
                     }
                     llm::MemoryAction::Thing { thing, desc, category, tags, importance, emotion, source, confidence, related } => {
-                        let id = db::insert_thing(&conn, thing, desc.as_deref(), category.as_deref(), tags.as_deref(), *importance, emotion.as_deref(), source.as_deref(), *confidence, related.as_deref(), &created_at).expect("failed to store");
+                        let id = db::insert_thing(conn, thing, desc.as_deref(), category.as_deref(), tags.as_deref(), *importance, emotion.as_deref(), source.as_deref(), *confidence, related.as_deref(), &created_at).expect("failed to store");
                         let mid = format!("T{}", id);
                         println!("[{}] thing: {}", mid, thing);
                         stored += 1;
                     }
                     llm::MemoryAction::Person { name, role, relationship, contact, met_at, last_seen, note, tags, importance, emotion } => {
-                        let id = db::insert_person(&conn, name, role.as_deref(), relationship.as_deref(), contact.as_deref(), met_at.as_deref(), last_seen.as_deref(), note.as_deref(), tags.as_deref(), *importance, emotion.as_deref(), &created_at).expect("failed to store");
+                        let id = db::insert_person(conn, name, role.as_deref(), relationship.as_deref(), contact.as_deref(), met_at.as_deref(), last_seen.as_deref(), note.as_deref(), tags.as_deref(), *importance, emotion.as_deref(), &created_at).expect("failed to store");
                         let mid = format!("P{}", id);
                         println!("[{}] person: {}", mid, name);
                         stored += 1;
                     }
                     llm::MemoryAction::Place { name, desc, address, kind, note, tags, importance, emotion } => {
-                        let id = db::insert_place(&conn, name, desc.as_deref(), address.as_deref(), kind.as_deref(), note.as_deref(), tags.as_deref(), *importance, emotion.as_deref(), &created_at).expect("failed to store");
+                        let id = db::insert_place(conn, name, desc.as_deref(), address.as_deref(), kind.as_deref(), note.as_deref(), tags.as_deref(), *importance, emotion.as_deref(), &created_at).expect("failed to store");
                         let mid = format!("L{}", id);
                         println!("[{}] place: {}", mid, name);
                         stored += 1;
                     }
                     llm::MemoryAction::Alter { id, fields } => {
-                        match db::alter(&conn, id, fields) {
+                        match db::alter(conn, id, fields) {
                             Ok(true) => { println!("[{}] altered", id); updated += 1; }
                             Ok(false) => eprintln!("  alter {}: not found", id),
                             Err(e) => eprintln!("  alter {}: {}", id, e),
                         }
                     }
                     llm::MemoryAction::Forget { id } => {
-                        match db::forget(&conn, id) {
+                        match db::forget(conn, id) {
                             Ok(true) => { println!("[{}] forgotten", id); forgotten += 1; }
                             Ok(false) => eprintln!("  forget {}: not found", id),
                             Err(e) => eprintln!("  forget {}: {}", id, e),
@@ -360,6 +361,11 @@ async fn main() {
                 }
             }
             conn.execute_batch("COMMIT").expect("failed to commit transaction");
+
+            // Rebuild bloom filter after bulk ingest
+            if stored > 0 || updated > 0 {
+                db.rebuild_bloom();
+            }
 
             println!("\nDone: {} stored, {} updated, {} forgotten", stored, updated, forgotten);
         }
@@ -380,8 +386,7 @@ async fn main() {
                 let t = time.as_deref().unwrap_or("00:00");
                 format!("{} {}", d, t)
             });
-            let id = db::insert_event(
-                &conn,
+            let id = db.insert_event(
                 &event,
                 datetime.as_deref(),
                 note.as_deref(),
@@ -422,7 +427,7 @@ async fn main() {
             println!("  Importance: {}", importance);
         }
         Command::Forget { id } => {
-            match db::forget(&conn, &id) {
+            match db.forget(&id) {
                 Ok(true) => println!("Forgotten: {}", id),
                 Ok(false) => println!("Not found: {}", id),
                 Err(e) => eprintln!("Error: {}", e),
@@ -462,7 +467,7 @@ async fn main() {
             if changes.is_empty() {
                 println!("Nothing to alter. Provide at least one field to change.");
             } else {
-                match db::alter(&conn, &id, &changes) {
+                match db.alter(&id, &changes) {
                     Ok(true) => println!("Altered: {}", id),
                     Ok(false) => println!("Not found: {}", id),
                     Err(e) => eprintln!("Error: {}", e),
@@ -477,7 +482,7 @@ async fn main() {
                 memory_type: kind,
                 source,
             };
-            let results = db::recall(&conn, &query, limit, offset, &filters);
+            let results = db.recall(&query, limit, offset, &filters);
             if results.is_empty() {
                 println!("No memories found for: {}", query);
             } else {
@@ -496,7 +501,7 @@ async fn main() {
                 std::process::exit(1);
             }
             let timeout_dur = std::time::Duration::from_millis(timeout);
-            let result = db::find_connections(&conn, &concepts, min, timeout_dur);
+            let result = db.find_connections(&concepts, min, timeout_dur);
             let elapsed = result.elapsed_ms;
 
             if result.connections.is_empty() {
@@ -528,7 +533,7 @@ async fn main() {
         }
         Command::Thing { thing, desc, category, tags, importance, emotion, source, confidence, related } => {
             let created_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
-            let id = db::insert_thing(&conn, &thing, desc.as_deref(), category.as_deref(), tags.as_deref(), importance, emotion.as_deref(), source.as_deref(), confidence, related.as_deref(), &created_at).expect("failed to store thing");
+            let id = db.insert_thing(&thing, desc.as_deref(), category.as_deref(), tags.as_deref(), importance, emotion.as_deref(), source.as_deref(), confidence, related.as_deref(), &created_at).expect("failed to store thing");
             println!("Thing remembered [T{}]:", id);
             println!("  What:       {}", thing);
             if let Some(v) = &desc { println!("  Desc:       {}", v); }
@@ -542,7 +547,7 @@ async fn main() {
         }
         Command::Person { name, role, relationship, contact, met_at, last_seen, note, tags, emotion, importance } => {
             let created_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
-            let id = db::insert_person(&conn, &name, role.as_deref(), relationship.as_deref(), contact.as_deref(), met_at.as_deref(), last_seen.as_deref(), note.as_deref(), tags.as_deref(), importance, emotion.as_deref(), &created_at).expect("failed to store person");
+            let id = db.insert_person(&name, role.as_deref(), relationship.as_deref(), contact.as_deref(), met_at.as_deref(), last_seen.as_deref(), note.as_deref(), tags.as_deref(), importance, emotion.as_deref(), &created_at).expect("failed to store person");
             println!("Person remembered [P{}]:", id);
             println!("  Name:       {}", name);
             if let Some(v) = &role { println!("  Role:       {}", v); }
@@ -557,7 +562,7 @@ async fn main() {
         }
         Command::Place { name, desc, address, kind, note, tags, emotion, importance } => {
             let created_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
-            let id = db::insert_place(&conn, &name, desc.as_deref(), address.as_deref(), kind.as_deref(), note.as_deref(), tags.as_deref(), importance, emotion.as_deref(), &created_at).expect("failed to store place");
+            let id = db.insert_place(&name, desc.as_deref(), address.as_deref(), kind.as_deref(), note.as_deref(), tags.as_deref(), importance, emotion.as_deref(), &created_at).expect("failed to store place");
             println!("Place remembered [L{}]:", id);
             println!("  Name:       {}", name);
             if let Some(v) = &desc { println!("  Desc:       {}", v); }

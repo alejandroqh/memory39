@@ -82,17 +82,19 @@ fn contains_ci(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
 }
 
-pub(crate) fn expand_query_for_prefix(query: &str) -> Option<String> {
-    // Don't mangle queries with explicit FTS5 syntax
+pub(crate) fn has_fts5_operators(query: &str) -> bool {
     if query.contains('"') || query.contains('*') || query.contains('(')
         || query.contains(')') || query.contains(':')
     {
-        return None;
+        return true;
     }
     let bytes = query.as_bytes();
-    if contains_ci(bytes, b" AND ") || contains_ci(bytes, b" OR ") || contains_ci(bytes, b" NOT ")
+    contains_ci(bytes, b" AND ") || contains_ci(bytes, b" OR ") || contains_ci(bytes, b" NOT ")
         || contains_ci(bytes, b"NEAR")
-    {
+}
+
+pub(crate) fn expand_query_for_prefix(query: &str) -> Option<String> {
+    if has_fts5_operators(query) {
         return None;
     }
 

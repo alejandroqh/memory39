@@ -4,12 +4,12 @@ use turbomcp::prelude::*;
 
 #[derive(Clone)]
 struct Memory39 {
-    conn: Arc<Mutex<rusqlite::Connection>>,
+    db: Arc<Mutex<db::MemoryDb>>,
 }
 
 impl Memory39 {
-    fn lock_conn(&self) -> McpResult<std::sync::MutexGuard<'_, rusqlite::Connection>> {
-        self.conn.lock().map_err(|e| McpError::internal(e.to_string()))
+    fn lock_db(&self) -> McpResult<std::sync::MutexGuard<'_, db::MemoryDb>> {
+        self.db.lock().map_err(|e| McpError::internal(e.to_string()))
     }
 }
 
@@ -37,7 +37,7 @@ impl Memory39 {
         let limit = limit.unwrap_or(10).min(100) as usize;
         let offset = offset.unwrap_or(0) as usize;
         let results = {
-            let conn = self.lock_conn()?;
+            let mdb = self.lock_db()?;
             let filters = db::RecallFilters {
                 min_importance,
                 date_from: from,
@@ -45,7 +45,7 @@ impl Memory39 {
                 memory_type: kind.filter(|s| !s.is_empty()),
                 source: source.filter(|s| !s.is_empty()),
             };
-            db::recall(&conn, &query, limit, offset, &filters)
+            mdb.recall(&query, limit, offset, &filters)
         };
         if results.is_empty() {
             return Ok(format!("No memories found for: {}", query));
@@ -84,9 +84,8 @@ impl Memory39 {
             format!("{} {}", d, t)
         });
         let id = {
-            let conn = self.lock_conn()?;
-            db::insert_event(
-                &conn,
+            let mut mdb = self.lock_db()?;
+            mdb.insert_event(
                 &event,
                 datetime.as_deref(),
                 note.as_deref(),
@@ -125,9 +124,8 @@ impl Memory39 {
     ) -> McpResult<String> {
         let created_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
         let id = {
-            let conn = self.lock_conn()?;
-            db::insert_thing(
-                &conn,
+            let mut mdb = self.lock_db()?;
+            mdb.insert_thing(
                 &thing,
                 desc.as_deref(),
                 category.as_deref(),
@@ -162,9 +160,8 @@ impl Memory39 {
     ) -> McpResult<String> {
         let created_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
         let id = {
-            let conn = self.lock_conn()?;
-            db::insert_person(
-                &conn,
+            let mut mdb = self.lock_db()?;
+            mdb.insert_person(
                 &name,
                 role.as_deref(),
                 relationship.as_deref(),
@@ -198,9 +195,8 @@ impl Memory39 {
     ) -> McpResult<String> {
         let created_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
         let id = {
-            let conn = self.lock_conn()?;
-            db::insert_place(
-                &conn,
+            let mut mdb = self.lock_db()?;
+            mdb.insert_place(
                 &name,
                 desc.as_deref(),
                 address.as_deref(),
@@ -222,8 +218,8 @@ impl Memory39 {
         &self,
         #[description("Memory ID to delete (e.g. E3, U1, T2, P1, L4)")] id: String,
     ) -> McpResult<String> {
-        let conn = self.lock_conn()?;
-        match db::forget(&conn, &id) {
+        let mdb = self.lock_db()?;
+        match mdb.forget(&id) {
             Ok(true) => Ok(format!("Forgotten: {}", id)),
             Ok(false) => Ok(format!("Not found: {}", id)),
             Err(e) => Err(McpError::internal(e.to_string())),
@@ -282,8 +278,8 @@ impl Memory39 {
             return Ok("Nothing to alter. Provide at least one field to change.".into());
         }
         match {
-            let conn = self.lock_conn()?;
-            db::alter(&conn, &id, &changes)
+            let mut mdb = self.lock_db()?;
+            mdb.alter(&id, &changes)
         } {
             Ok(true) => Ok(format!("Altered: {}", id)),
             Ok(false) => Ok(format!("Not found: {}", id)),
@@ -308,8 +304,8 @@ impl Memory39 {
         }
         let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(2000));
         let result = {
-            let conn = self.lock_conn()?;
-            db::find_connections(&conn, &concepts, min_importance, timeout)
+            let mdb = self.lock_db()?;
+            mdb.find_connections(&concepts, min_importance, timeout)
         };
 
         if result.connections.is_empty() {
@@ -370,11 +366,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&db_dir)
         .map_err(|e| format!("failed to create ~/.memory39: {}", e))?;
     let db_path = db_dir.join("memory39.db");
-    let conn = db::open(&db_path)
+    let mdb = db::open(&db_path)
         .map_err(|e| format!("failed to open database: {}", e))?;
 
     let server = Memory39 {
-        conn: Arc::new(Mutex::new(conn)),
+        db: Arc::new(Mutex::new(mdb)),
     };
     server.run_stdio().await?;
     Ok(())
