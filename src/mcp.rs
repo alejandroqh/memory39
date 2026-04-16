@@ -1,11 +1,11 @@
-use memory39::db;
+use crate::db;
 use std::sync::{Arc, Mutex};
 use turbomcp::prelude::*;
 
 // Compile-time check: MCP server version must match Cargo.toml
 const _: () = {
     let cargo = env!("CARGO_PKG_VERSION").as_bytes();
-    let mcp = b"1.0.0";
+    let mcp = b"1.0.1";
     assert!(cargo.len() == mcp.len(), "MCP server version does not match Cargo.toml — update #[server(version)] below");
     let mut i = 0;
     while i < cargo.len() {
@@ -27,7 +27,7 @@ impl Memory39 {
 
 #[server(
     name = "memory39",
-    version = "1.0.0",
+    version = "1.0.1",
     description = "Temporal-priority memory system for AI agents"
 )]
 #[allow(clippy::too_many_arguments)]
@@ -372,8 +372,7 @@ impl Memory39 {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_mcp_stdio() -> Result<(), Box<dyn std::error::Error>> {
     let db_dir = dirs::home_dir()
         .expect("cannot determine home directory")
         .join(".memory39");

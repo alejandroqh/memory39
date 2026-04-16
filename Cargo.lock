@@ -1094,7 +1094,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "memory39"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bloomfilter",
  "chrono",
@@ -2110,8 +2110,9 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "turbomcp"
-version = "3.0.11"
-source = "git+https://github.com/Epistates/turbomcp#109b8dd445d83f6ffeec2da5a4097f6c3c989b87"
+version = "3.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53818b5c53f7088aaf2ce7612f707cdd5804902dc10aed92ebfa578bc2b833cd"
 dependencies = [
  "schemars",
  "serde",
@@ -2130,8 +2131,9 @@ dependencies = [
 
 [[package]]
 name = "turbomcp-core"
-version = "3.0.11"
-source = "git+https://github.com/Epistates/turbomcp#109b8dd445d83f6ffeec2da5a4097f6c3c989b87"
+version = "3.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91011a9b07a9d399887df2dae305aba4410844228950c1fccb1a9619892e6925"
 dependencies = [
  "base64",
  "chrono",
@@ -2147,8 +2149,9 @@ dependencies = [
 
 [[package]]
 name = "turbomcp-macros"
-version = "3.0.11"
-source = "git+https://github.com/Epistates/turbomcp#109b8dd445d83f6ffeec2da5a4097f6c3c989b87"
+version = "3.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3c5d04ec51c48a23f08d5985e33624b5c1d2340d4e72f7888a2c32eb6b7dc66"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -2162,8 +2165,9 @@ dependencies = [
 
 [[package]]
 name = "turbomcp-protocol"
-version = "3.0.11"
-source = "git+https://github.com/Epistates/turbomcp#109b8dd445d83f6ffeec2da5a4097f6c3c989b87"
+version = "3.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12b95904acdabef794743d9a444883b8dafe1b4d77b296b6e214c2648b8b28e3"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2197,8 +2201,9 @@ dependencies = [
 
 [[package]]
 name = "turbomcp-server"
-version = "3.0.11"
-source = "git+https://github.com/Epistates/turbomcp#109b8dd445d83f6ffeec2da5a4097f6c3c989b87"
+version = "3.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75a45dcdc2c7d353db175b1cd004f063dc6f68832345c5456aae2e98d0b71b84"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2222,8 +2227,9 @@ dependencies = [
 
 [[package]]
 name = "turbomcp-stdio"
-version = "3.0.11"
-source = "git+https://github.com/Epistates/turbomcp#109b8dd445d83f6ffeec2da5a4097f6c3c989b87"
+version = "3.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d98594f9db3a9ff33040b2bd464dcb59fd874ab86200f9c716747af26dabbd6"
 dependencies = [
  "bytes",
  "futures",
@@ -2239,8 +2245,9 @@ dependencies = [
 
 [[package]]
 name = "turbomcp-transport"
-version = "3.0.11"
-source = "git+https://github.com/Epistates/turbomcp#109b8dd445d83f6ffeec2da5a4097f6c3c989b87"
+version = "3.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b2aae62f02d31008965bd4daffaf019ef7181a1551b1650ca13a8620851d0f7"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2269,8 +2276,9 @@ dependencies = [
 
 [[package]]
 name = "turbomcp-transport-traits"
-version = "3.0.11"
-source = "git+https://github.com/Epistates/turbomcp#109b8dd445d83f6ffeec2da5a4097f6c3c989b87"
+version = "3.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71c6af6c1a621f80174d60a025c2eccfab7d435c3ba746e9904efe029297d051"
 dependencies = [
  "bytes",
  "futures",
@@ -2283,8 +2291,9 @@ dependencies = [
 
 [[package]]
 name = "turbomcp-types"
-version = "3.0.11"
-source = "git+https://github.com/Epistates/turbomcp#109b8dd445d83f6ffeec2da5a4097f6c3c989b87"
+version = "3.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1814cd60f10be9252e28fc3635ddf9bf8b3935d8201e7de69045e5c26d4e940"
 dependencies = [
  "serde",
  "serde_json",

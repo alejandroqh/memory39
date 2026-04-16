@@ -29,7 +29,7 @@ Configured for 600K items at 0.001% false positive rate.
 cargo install memory39
 ```
 
-This installs two binaries: **`memory39-cli`** and **`memory39-mcp`**.
+Single binary: CLI by default, MCP server with `memory39 mcp`.
 
 ## Memory Types
 
@@ -77,13 +77,13 @@ Conversations are split into ~8K-char chunks on actor switches (every 2 switches
 
 ```bash
 # From stdin (any text format)
-cat conversation.txt | memory39-cli ingest -
+cat conversation.txt | memory39 ingest -
 
 # Inline
-memory39-cli ingest "Alice said she's moving to Berlin in March"
+memory39 ingest "Alice said she's moving to Berlin in March"
 
 # Chat logs, transcripts, meeting notes - all work
-cat slack_export.txt | memory39-cli ingest - --llm groq
+cat slack_export.txt | memory39 ingest - --llm groq
 ```
 
 **What gets extracted:**
@@ -123,7 +123,7 @@ cat slack_export.txt | memory39-cli ingest - --llm groq
 #### `event` - Store an event
 
 ```bash
-memory39-cli event "Had coffee with Alice" --date 2025-03-15 --people Alice --tags coffee,social
+memory39 event "Had coffee with Alice" --date 2025-03-15 --people Alice --tags coffee,social
 ```
 
 | Arg/Flag | Required | Description |
@@ -142,7 +142,7 @@ memory39-cli event "Had coffee with Alice" --date 2025-03-15 --people Alice --ta
 #### `thing` - Store a fact or concept
 
 ```bash
-memory39-cli thing "Rust edition 2024 requires rustc 1.85+" --category programming --confidence 9
+memory39 thing "Rust edition 2024 requires rustc 1.85+" --category programming --confidence 9
 ```
 
 | Arg/Flag | Required | Description |
@@ -160,7 +160,7 @@ memory39-cli thing "Rust edition 2024 requires rustc 1.85+" --category programmi
 #### `person` - Store a social memory
 
 ```bash
-memory39-cli person "Alice" --role "ML engineer" --relationship colleague --met-at "KubeCon 2024"
+memory39 person "Alice" --role "ML engineer" --relationship colleague --met-at "KubeCon 2024"
 ```
 
 | Arg/Flag | Required | Description |
@@ -179,7 +179,7 @@ memory39-cli person "Alice" --role "ML engineer" --relationship colleague --met-
 #### `place` - Store a spatial memory
 
 ```bash
-memory39-cli place "Blue Bottle Coffee" --address "123 Main St, SF" --kind building --tags coffee,work
+memory39 place "Blue Bottle Coffee" --address "123 Main St, SF" --kind building --tags coffee,work
 ```
 
 | Arg/Flag | Required | Description |
@@ -196,8 +196,8 @@ memory39-cli place "Blue Bottle Coffee" --address "123 Main St, SF" --kind build
 #### `recall` - Search memories
 
 ```bash
-memory39-cli recall "coffee" --limit 5 --min 3 --kind event
-memory39-cli recall "*"  # list all
+memory39 recall "coffee" --limit 5 --min 3 --kind event
+memory39 recall "*"  # list all
 ```
 
 | Arg/Flag | Required | Description |
@@ -214,7 +214,7 @@ memory39-cli recall "*"  # list all
 #### `connect` - Find connections between concepts
 
 ```bash
-memory39-cli connect Alice Berlin meeting
+memory39 connect Alice Berlin meeting
 ```
 
 | Arg/Flag | Required | Description |
@@ -228,13 +228,13 @@ Three-phase discovery: **(1) direct** - all concepts in one memory, **(2) shared
 #### `forget` - Delete a memory
 
 ```bash
-memory39-cli forget E3
+memory39 forget E3
 ```
 
 #### `alter` - Modify a memory
 
 ```bash
-memory39-cli alter T2 --text "Updated fact" --importance 8
+memory39 alter T2 --text "Updated fact" --importance 8
 ```
 
 | Flag | Description |
@@ -254,7 +254,7 @@ memory39-cli alter T2 --text "Updated fact" --importance 8
 
 ## MCP Server
 
-`memory39-mcp` exposes all database tools over MCP (STDIO transport). The `ingest` command is excluded - only direct operations are available.
+`memory39 mcp` starts the MCP server (STDIO transport). The `ingest` command is excluded — only direct database operations are available.
 
 Database path: `~/.memory39/memory39.db` (auto-created).
 
@@ -266,7 +266,8 @@ Add to your MCP client (Claude Desktop, Claude Code, etc.):
 {
   "mcpServers": {
     "memory39": {
-      "command": "memory39-mcp"
+      "command": "memory39",
+      "args": ["mcp"]
     }
   }
 }

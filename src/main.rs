@@ -216,6 +216,8 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Start MCP server (STDIO transport)
+    Mcp,
     /// Store a place (spatial memory about a location)
     Place {
         /// Name of the place (max 255 chars)
@@ -255,6 +257,10 @@ async fn main() {
     };
 
     match cli.command {
+        Command::Mcp => {
+            memory39::mcp::run_mcp_stdio().await.expect("MCP server failed");
+            return;
+        }
         Command::Ingest { input, user_id: _, timestamp: _ } => {
             let mut config = llm::LlmConfig::preset(&cli.llm)
                 .unwrap_or_else(|| {
