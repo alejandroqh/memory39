@@ -6,8 +6,6 @@ ulimit -n 4096 2>/dev/null || true
 
 VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])")
 NAME="memory39"
-CLI_BIN="memory39-cli"
-MCP_BIN="memory39-mcp"
 OUT_DIR="dist"
 
 mkdir -p "$OUT_DIR"
@@ -23,24 +21,41 @@ GEMINI_API_KEY=
 ENVEOF
 echo "  -> $OUT_DIR/.env.sample"
 
-# build_target LABEL TARGET CARGO_CMD SUFFIX
-build_target() {
-  local label="$1" target="$2" cmd="$3" suffix="${4:-}"
-  echo ""
-  echo "--- $label ($target) ---"
-  $cmd --release --target "$target"
-  cp "target/$target/release/${CLI_BIN}${suffix}" "$OUT_DIR/${NAME}-cli-${label}${suffix}"
-  cp "target/$target/release/${MCP_BIN}${suffix}" "$OUT_DIR/${NAME}-mcp-${label}${suffix}"
-  echo "  -> $OUT_DIR/${NAME}-cli-${label}${suffix}"
-  echo "  -> $OUT_DIR/${NAME}-mcp-${label}${suffix}"
-}
+# macOS ARM64 (native)
+echo ""
+echo "--- macOS arm64 (aarch64-apple-darwin) ---"
+cargo build --release --target aarch64-apple-darwin
+cp target/aarch64-apple-darwin/release/$NAME "$OUT_DIR/${NAME}-macos-arm64"
+echo "  -> $OUT_DIR/${NAME}-macos-arm64"
 
-build_target macos-arm64 aarch64-apple-darwin       "cargo build"
-build_target macos-x64   x86_64-apple-darwin        "cargo build"
-build_target linux-arm64 aarch64-unknown-linux-musl  "cargo zigbuild"
-build_target linux-x64   x86_64-unknown-linux-musl   "cargo zigbuild"
-build_target windows-x64 x86_64-pc-windows-msvc      "cargo xwin build" .exe
+# macOS x86_64 (cross-compile)
+echo ""
+echo "--- macOS x64 (x86_64-apple-darwin) ---"
+cargo build --release --target x86_64-apple-darwin
+cp target/x86_64-apple-darwin/release/$NAME "$OUT_DIR/${NAME}-macos-x64"
+echo "  -> $OUT_DIR/${NAME}-macos-x64"
+
+# Linux ARM64 (cross-compile via zigbuild, static musl)
+echo ""
+echo "--- Linux arm64 (aarch64-unknown-linux-musl) ---"
+cargo zigbuild --release --target aarch64-unknown-linux-musl
+cp target/aarch64-unknown-linux-musl/release/$NAME "$OUT_DIR/${NAME}-linux-arm64"
+echo "  -> $OUT_DIR/${NAME}-linux-arm64"
+
+# Linux x86_64 (cross-compile via zigbuild, static musl)
+echo ""
+echo "--- Linux x64 (x86_64-unknown-linux-musl) ---"
+cargo zigbuild --release --target x86_64-unknown-linux-musl
+cp target/x86_64-unknown-linux-musl/release/$NAME "$OUT_DIR/${NAME}-linux-x64"
+echo "  -> $OUT_DIR/${NAME}-linux-x64"
+
+# Windows x86_64 (cross-compile via cargo-xwin, MSVC target)
+echo ""
+echo "--- Windows x64 (x86_64-pc-windows-msvc) ---"
+cargo xwin build --release --target x86_64-pc-windows-msvc
+cp target/x86_64-pc-windows-msvc/release/$NAME.exe "$OUT_DIR/${NAME}-windows-x64.exe"
+echo "  -> $OUT_DIR/${NAME}-windows-x64.exe"
 
 echo ""
 echo "=== Done ==="
-ls -lh "$OUT_DIR"/${NAME}-cli-* "$OUT_DIR"/${NAME}-mcp-*
+ls -lh "$OUT_DIR"/${NAME}-*
