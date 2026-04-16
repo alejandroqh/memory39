@@ -9,3 +9,4 @@ __pycache__/
 .DS_Store
 .env
 CLAUDE.md
+bench/agent-memory-benchmark/
