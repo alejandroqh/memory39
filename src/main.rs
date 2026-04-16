@@ -250,6 +250,12 @@ enum Command {
 async fn main() {
     llm::load_dotenv();
     let cli = Cli::parse();
+
+    if matches!(cli.command, Command::Mcp) {
+        memory39::mcp::run_mcp_stdio().await.expect("MCP server failed");
+        return;
+    }
+
     let mut db = if cli.ram {
         db::open_ram().expect("failed to open in-memory database")
     } else {
@@ -257,10 +263,7 @@ async fn main() {
     };
 
     match cli.command {
-        Command::Mcp => {
-            memory39::mcp::run_mcp_stdio().await.expect("MCP server failed");
-            return;
-        }
+        Command::Mcp => unreachable!(),
         Command::Ingest { input, user_id: _, timestamp: _ } => {
             let mut config = llm::LlmConfig::preset(&cli.llm)
                 .unwrap_or_else(|| {

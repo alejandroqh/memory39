@@ -29,6 +29,14 @@ Configured for 600K items at 0.001% false positive rate.
 cargo install memory39
 ```
 
+### Install for any AI CLI / IDE
+
+Installs the binary and auto-configures it for every MCP client detected: **Claude Code**, **Claude Desktop**, **Codex**, **OpenCode**, **OpenClaw**.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/alejandroqh/marketplace/main/h39.sh | sh
+```
+
 Single binary: CLI by default, MCP server with `memory39 mcp`.
 
 ## Memory Types
@@ -260,7 +268,7 @@ Database path: `~/.memory39/memory39.db` (auto-created).
 
 ### Configuration
 
-Add to your MCP client (Claude Desktop, Claude Code, etc.):
+Add to your MCP client config:
 
 ```json
 {
