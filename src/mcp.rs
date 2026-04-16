@@ -385,6 +385,9 @@ pub async fn run_mcp_stdio() -> Result<(), Box<dyn std::error::Error>> {
     let server = Memory39 {
         db: Arc::new(Mutex::new(mdb)),
     };
-    server.run_stdio().await?;
+    server.builder()
+        .with_protocol(ProtocolConfig::multi_version())
+        .serve()
+        .await?;
     Ok(())
 }
