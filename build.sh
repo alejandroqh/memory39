@@ -12,15 +12,6 @@ mkdir -p "$OUT_DIR"
 
 echo "=== Building $NAME v$VERSION ==="
 
-# --- .env.sample ---
-cat > "$OUT_DIR/.env.sample" <<'ENVEOF'
-DEEPSEEK_API_KEY=
-GROQ_API_KEY=
-OPENAI_API_KEY=
-GEMINI_API_KEY=
-ENVEOF
-echo "  -> $OUT_DIR/.env.sample"
-
 # macOS ARM64 (native)
 echo ""
 echo "--- macOS arm64 (aarch64-apple-darwin) ---"

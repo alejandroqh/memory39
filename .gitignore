@@ -3,6 +3,7 @@
 *.db
 *.db-journal
 *.db-wal
+*.bloom
 __pycache__/
 *.pyc
 .venv/
