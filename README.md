@@ -6,7 +6,7 @@ Memories are scored by **0.4 x relevance + 0.3 x importance + 0.3 x recency** (3
 
 ## Why memory39
 
-- **Persistent across sessions**: memories live in an on-disk SQLite file and survive restarts, CLI invocations, and MCP reconnects. Your agent remembers today what it learned yesterday.
+- **Persistent across sessions**: memories live in an on-disk SQLite file and survive restarts, CLI invocations, and MCP reconnects. 
 - **One knowledge base across every MCP client**: Claude Code, Claude Desktop, Codex, OpenCode, and OpenClaw all point at the same `~/.memory39/memory39.db`. A fact ingested from Claude is instantly recallable from Codex; a person stored via the CLI shows up in every MCP client. No syncing, no duplication.
 - **Local and private**: no cloud, no account, no telemetry. Your memory is a single SQLite file on your machine that you can inspect, back up, or move by copying.
 - **Single binary, zero daemon**: CLI for scripting (`memory39 recall ...`), MCP server on demand (`memory39 mcp`). Nothing runs in the background between calls.
