@@ -5,12 +5,52 @@ mod connect;
 mod bloom;
 
 use rusqlite::{Connection, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use bloom::MemoryDb;
 pub use crud::{insert_event, insert_thing, insert_person, insert_place, memory_id, parse_memory_id, text_field_for_id, forget, alter};
 pub use recall::{RecallFilters, RecallResult, recall};
 pub use connect::{ConnectionKind, Connection_, ConnectionResult, find_connections};
+
+/// Resolve the DB path. Precedence:
+/// (1) explicit `override_path` (e.g., a `--db` flag);
+/// (2) `MEMORY39_DB` env var (supports a leading `~/`);
+/// (3) default `~/.memory39/memory39.db`.
+/// The parent directory is created so the first run doesn't fail.
+pub fn resolve_path(override_path: Option<&Path>) -> std::io::Result<PathBuf> {
+    let path = pick_path(override_path)?;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(path)
+}
+
+fn pick_path(override_path: Option<&Path>) -> std::io::Result<PathBuf> {
+    if let Some(p) = override_path {
+        return Ok(p.to_path_buf());
+    }
+    if let Ok(raw) = std::env::var("MEMORY39_DB") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Ok(expand_tilde(trimmed));
+        }
+    }
+    let home = dirs::home_dir().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "home directory unknown")
+    })?;
+    Ok(home.join(".memory39").join("memory39.db"))
+}
+
+fn expand_tilde(s: &str) -> PathBuf {
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(s)
+}
 
 fn open_conn(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;

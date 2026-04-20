@@ -4,6 +4,15 @@ Temporal-priority memory system for AI agents. Rust CLI + MCP server backed by S
 
 Memories are scored by **0.4 x relevance + 0.3 x importance + 0.3 x recency** (30-day half-life), so recent important matches surface first.
 
+## Why memory39
+
+- **Persistent across sessions**: memories live in an on-disk SQLite file and survive restarts, CLI invocations, and MCP reconnects. Your agent remembers today what it learned yesterday.
+- **One knowledge base across every MCP client**: Claude Code, Claude Desktop, Codex, OpenCode, and OpenClaw all point at the same `~/.memory39/memory39.db`. A fact ingested from Claude is instantly recallable from Codex; a person stored via the CLI shows up in every MCP client. No syncing, no duplication.
+- **Local and private**: no cloud, no account, no telemetry. Your memory is a single SQLite file on your machine that you can inspect, back up, or move by copying.
+- **Single binary, zero daemon**: CLI for scripting (`memory39 recall ...`), MCP server on demand (`memory39 mcp`). Nothing runs in the background between calls.
+- **Portable DB path**: point at a different database by exporting `MEMORY39_DB=/path/to/other.db` (supports `~/` expansion). Useful for project-scoped memory or isolated benchmarks.
+- **Cross-type discovery**: the `connect` command links concepts across events, things, persons, and places in a single query, so relationships surface even when facts are stored as different memory types.
+
 ## Performance
 
 memory39 uses a **bloom filter** as a pre-check layer before FTS5 queries. On every `recall`, the bloom filter tests whether the query tokens exist anywhere in the database - if they definitely don't, the FTS5 query is skipped entirely, returning zero results in **O(1)** with no disk I/O.
@@ -262,9 +271,9 @@ memory39 alter T2 --text "Updated fact" --importance 8
 
 ## MCP Server
 
-`memory39 mcp` starts the MCP server (STDIO transport). The `ingest` command is excluded — only direct database operations are available.
+`memory39 mcp` starts the MCP server (STDIO transport). The `ingest` command is excluded; only direct database operations are available. **No LLM API keys are needed to run the MCP server**, since the LLM is only used by `ingest`.
 
-Database path: `~/.memory39/memory39.db` (auto-created).
+Database path: `~/.memory39/memory39.db` (auto-created). This path is **shared across every MCP client on the machine**, so configuring memory39 in Claude Code, Claude Desktop, Codex, OpenCode, and OpenClaw gives all of them the same memory. Override with `MEMORY39_DB=/path/to/other.db` for project-scoped or isolated databases.
 
 ### Configuration
 
@@ -322,13 +331,24 @@ All tools use the same universal ID system:
 
 ## Environment
 
-Create a `.env` file (only needed for `ingest`):
+**LLM API keys are only required for the `ingest` command.** Everything else (every other CLI command: `event`, `thing`, `person`, `place`, `recall`, `connect`, `forget`, `alter`, and the entire MCP server) runs purely against the local SQLite database and needs no keys, no network, and no `.env` file.
+
+| Variable | Used by | Purpose |
+|----------|---------|---------|
+| `MEMORY39_DB` | MCP server | Override DB path (supports leading `~/`). Default: `~/.memory39/memory39.db`. For the CLI, use the `--db` flag instead. |
+| `DEEPSEEK_API_KEY` | `ingest` only | DeepSeek API key |
+| `GROQ_API_KEY` | `ingest` only | Groq API key |
+| `OPENAI_API_KEY` | `ingest` only | OpenAI API key |
+
+If (and only if) you plan to use `ingest`, create a `.env` file with the key for the provider you want:
 
 ```bash
 DEEPSEEK_API_KEY=sk-...
 GROQ_API_KEY=gsk_...
 OPENAI_API_KEY=sk-...
 ```
+
+Using a local model with `--llm ollama` requires no API key at all.
 
 ## Built With
 

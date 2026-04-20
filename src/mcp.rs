@@ -373,12 +373,8 @@ impl Memory39 {
 }
 
 pub async fn run_mcp_stdio() -> Result<(), Box<dyn std::error::Error>> {
-    let db_dir = dirs::home_dir()
-        .expect("cannot determine home directory")
-        .join(".memory39");
-    std::fs::create_dir_all(&db_dir)
-        .map_err(|e| format!("failed to create ~/.memory39: {}", e))?;
-    let db_path = db_dir.join("memory39.db");
+    let db_path = db::resolve_path(None)
+        .map_err(|e| format!("failed to resolve db path: {}", e))?;
     let mdb = db::open(&db_path)
         .map_err(|e| format!("failed to open database: {}", e))?;
 

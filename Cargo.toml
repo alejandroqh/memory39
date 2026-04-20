@@ -28,12 +28,6 @@ exclude = [
 name = "memory39"
 path = "src/main.rs"
 
-[profile.release]
-strip = true
-lto = true
-codegen-units = 1
-panic = "abort"
-
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.34", features = ["bundled"] }
