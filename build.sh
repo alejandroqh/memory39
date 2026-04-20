@@ -4,8 +4,8 @@ set -euo pipefail
 # Static musl linking opens many file descriptors at once; raise the limit.
 ulimit -n 4096 2>/dev/null || true
 
-VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])")
 NAME="memory39"
+VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; d=json.load(sys.stdin); print(next(p['version'] for p in d['packages'] if p['name']=='$NAME'))")
 OUT_DIR="dist"
 
 mkdir -p "$OUT_DIR"
