@@ -1,5 +1,10 @@
-# memory39
-
+```
+▄▄▄▄  ▗▞▀▚▖▄▄▄▄   ▄▄▄   ▄▄▄ ▄   ▄ ▄▄▄▄ ▄▄▄▄ 
+█ █ █ ▐▛▀▀▘█ █ █ █   █ █    █   █    █ █  █ 
+█   █ ▝▚▄▄▖█   █ ▀▄▄▄▀ █     ▀▀▀█ ▀▀▀█ ▀▀▀█ 
+                            ▄   █ ▄▄▄█ ▄▄▄█ 
+                             ▀▀▀            
+```
 **One binary. One local SQLite file. One memory, shared by every MCP client on your machine.**
 
 memory39 is a Rust CLI + MCP server backed by SQLite + FTS5. Every MCP-capable AI tool on your machine (Claude Code, Claude Desktop, Codex, OpenCode, OpenClaw) reads and writes the same `~/.memory39/memory39.db`, so a fact learned in one client is instantly recallable from any other. No cloud, no daemon, no sync.
