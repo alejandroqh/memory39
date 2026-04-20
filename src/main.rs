@@ -1,4 +1,4 @@
-use memory39::{db, llm};
+use memory39::db;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -7,7 +7,7 @@ use std::path::PathBuf;
 #[command(
     name = "memory39",
     version,
-    about = "Temporal-priority memory system for AI agents"
+    about = "Single-binary, single-file, local memory shared by every MCP client."
 )]
 struct Cli {
     /// Path to SQLite database file
@@ -18,31 +18,12 @@ struct Cli {
     #[arg(long)]
     ram: bool,
 
-    /// LLM provider: deepseek, groq, openai, ollama (for ingest command)
-    #[arg(long, default_value = "deepseek")]
-    llm: String,
-
-    /// Override default model for the LLM provider
-    #[arg(long)]
-    model: Option<String>,
-
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Ingest a conversation: LLM extracts key facts and stores them
-    Ingest {
-        /// Conversation text (or - for stdin)
-        input: String,
-        /// Optional user/namespace for isolation
-        #[arg(long)]
-        user_id: Option<String>,
-        /// Optional timestamp (YYYY-MM-DD)
-        #[arg(long)]
-        timestamp: Option<String>,
-    },
     /// Store an event (something that happened or will happen). Omit date for undated events
     Event {
         /// What happened (max 255 chars)
@@ -248,7 +229,6 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
-    llm::load_dotenv();
     let cli = Cli::parse();
 
     if matches!(cli.command, Command::Mcp) {
@@ -264,123 +244,6 @@ async fn main() {
 
     match cli.command {
         Command::Mcp => unreachable!(),
-        Command::Ingest { input, user_id: _, timestamp: _ } => {
-            let mut config = llm::LlmConfig::preset(&cli.llm)
-                .unwrap_or_else(|| {
-                    eprintln!("Unknown LLM provider: {}. Use: deepseek, groq, openai, ollama", cli.llm);
-                    std::process::exit(1);
-                });
-            if let Some(m) = &cli.model {
-                config.model = m.clone();
-            }
-
-            let text = if input == "-" {
-                use std::io::Read;
-                let mut buf = String::new();
-                std::io::stdin().read_to_string(&mut buf).expect("failed to read stdin");
-                buf
-            } else {
-                input
-            };
-
-            eprintln!("Memory agent via {} ({})...", cli.llm, config.model);
-
-            let conn = db.conn();
-            let recall_fn = |query: &str| -> String {
-                let filters = db::RecallFilters {
-                    min_importance: None,
-                    date_from: None,
-                    date_to: None,
-                    memory_type: None,
-                    source: None,
-                };
-                let results = db::recall(conn, query, 5, 0, &filters);
-                if results.is_empty() {
-                    "No existing memories found.".into()
-                } else {
-                    let mut out = String::new();
-                    for r in &results {
-                        out.push_str(&format!("[{}] {} (score: {:.2})\n", r.mid, r.memory_type, r.score));
-                        for (k, v) in &r.fields {
-                            out.push_str(&format!("  {}: {}\n", k, v));
-                        }
-                    }
-                    out
-                }
-            };
-
-            let actions = match llm::ingest_conversation(&config, &text, &recall_fn).await {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("Failed: {}", e);
-                    std::process::exit(1);
-                }
-            };
-
-            let created_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
-            let mut stored = 0;
-            let mut updated = 0;
-            let mut forgotten = 0;
-
-            conn.execute_batch("BEGIN").expect("failed to begin transaction");
-            for action in &actions {
-                match action {
-                    llm::MemoryAction::Recall { query } => {
-                        eprintln!("  recall: {}", query);
-                    }
-                    llm::MemoryAction::Event { event, date, time, note, tags, importance, emotion, location, people, source } => {
-                        let datetime = date.as_ref().map(|d| {
-                            let t = time.as_deref().unwrap_or("00:00");
-                            format!("{} {}", d, t)
-                        });
-                        let id = db::insert_event(conn, event, datetime.as_deref(), note.as_deref(), tags.as_deref(), *importance, emotion.as_deref(), location.as_deref(), people.as_deref(), source.as_deref(), &created_at).expect("failed to store");
-                        let mid = if datetime.is_some() { format!("E{}", id) } else { format!("U{}", id) };
-                        println!("[{}] event: {}", mid, event);
-                        stored += 1;
-                    }
-                    llm::MemoryAction::Thing { thing, desc, category, tags, importance, emotion, source, confidence, related } => {
-                        let id = db::insert_thing(conn, thing, desc.as_deref(), category.as_deref(), tags.as_deref(), *importance, emotion.as_deref(), source.as_deref(), *confidence, related.as_deref(), &created_at).expect("failed to store");
-                        let mid = format!("T{}", id);
-                        println!("[{}] thing: {}", mid, thing);
-                        stored += 1;
-                    }
-                    llm::MemoryAction::Person { name, role, relationship, contact, met_at, last_seen, note, tags, importance, emotion } => {
-                        let id = db::insert_person(conn, name, role.as_deref(), relationship.as_deref(), contact.as_deref(), met_at.as_deref(), last_seen.as_deref(), note.as_deref(), tags.as_deref(), *importance, emotion.as_deref(), &created_at).expect("failed to store");
-                        let mid = format!("P{}", id);
-                        println!("[{}] person: {}", mid, name);
-                        stored += 1;
-                    }
-                    llm::MemoryAction::Place { name, desc, address, kind, note, tags, importance, emotion } => {
-                        let id = db::insert_place(conn, name, desc.as_deref(), address.as_deref(), kind.as_deref(), note.as_deref(), tags.as_deref(), *importance, emotion.as_deref(), &created_at).expect("failed to store");
-                        let mid = format!("L{}", id);
-                        println!("[{}] place: {}", mid, name);
-                        stored += 1;
-                    }
-                    llm::MemoryAction::Alter { id, fields } => {
-                        match db::alter(conn, id, fields) {
-                            Ok(true) => { println!("[{}] altered", id); updated += 1; }
-                            Ok(false) => eprintln!("  alter {}: not found", id),
-                            Err(e) => eprintln!("  alter {}: {}", id, e),
-                        }
-                    }
-                    llm::MemoryAction::Forget { id } => {
-                        match db::forget(conn, id) {
-                            Ok(true) => { println!("[{}] forgotten", id); forgotten += 1; }
-                            Ok(false) => eprintln!("  forget {}: not found", id),
-                            Err(e) => eprintln!("  forget {}: {}", id, e),
-                        }
-                    }
-                }
-            }
-            conn.execute_batch("COMMIT").expect("failed to commit transaction");
-
-            // Rebuild bloom filter after bulk ingest
-            if stored > 0 || updated > 0 {
-                db.rebuild_bloom();
-            }
-
-            println!("\nDone: {} stored, {} updated, {} forgotten", stored, updated, forgotten);
-        }
         Command::Event {
             event,
             date,

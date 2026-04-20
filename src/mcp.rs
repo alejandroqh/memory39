@@ -5,7 +5,7 @@ use turbomcp::prelude::*;
 // Compile-time check: MCP server version must match Cargo.toml
 const _: () = {
     let cargo = env!("CARGO_PKG_VERSION").as_bytes();
-    let mcp = b"1.0.1";
+    let mcp = b"1.0.3";
     assert!(cargo.len() == mcp.len(), "MCP server version does not match Cargo.toml — update #[server(version)] below");
     let mut i = 0;
     while i < cargo.len() {
@@ -27,8 +27,8 @@ impl Memory39 {
 
 #[server(
     name = "memory39",
-    version = "1.0.1",
-    description = "Temporal-priority memory system for AI agents"
+    version = "1.0.3",
+    description = "Single-binary, single-file, local memory shared by every MCP client."
 )]
 #[allow(clippy::too_many_arguments)]
 impl Memory39 {

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.3 (2026-04-20)
+
+### Removed
+
+- `ingest` subcommand and all LLM integration. memory39 now runs offline with no network, API keys, or `.env` file. The `--llm` and `--model` CLI flags are gone; the `llm` module and `reqwest` dependency have been removed.
+
+### Changed
+
+- MCP server resolves the DB path via a shared helper with precedence `--db` > `MEMORY39_DB` (supports leading `~/`) > `~/.memory39/memory39.db`, and creates the parent directory on first run.
+- README reorganized around persistence, cross-client shared knowledge base, and zero external dependencies.
+
 ## 1.0.1 — 2026-04-16
 
 First public release. Temporal-priority memory system for AI agents.

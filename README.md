@@ -1,13 +1,15 @@
 # memory39
 
-Temporal-priority memory system for AI agents. Rust CLI + MCP server backed by SQLite + FTS5.
+**One binary. One local SQLite file. One memory, shared by every MCP client on your machine.**
 
-Memories are scored by **0.4 x relevance + 0.3 x importance + 0.3 x recency** (30-day half-life), so recent important matches surface first.
+memory39 is a Rust CLI + MCP server backed by SQLite + FTS5. Every MCP-capable AI tool on your machine (Claude Code, Claude Desktop, Codex, OpenCode, OpenClaw) reads and writes the same `~/.memory39/memory39.db`, so a fact learned in one client is instantly recallable from any other. No cloud, no daemon, no sync.
+
+Results are ranked by temporal-priority scoring: **0.4 x relevance + 0.3 x importance + 0.3 x recency** (30-day half-life), so recent important matches surface first.
 
 ## Why memory39
 
-- **Persistent across sessions**: memories live in an on-disk SQLite file and survive restarts, CLI invocations, and MCP reconnects. 
-- **One knowledge base across every MCP client**: Claude Code, Claude Desktop, Codex, OpenCode, and OpenClaw all point at the same `~/.memory39/memory39.db`. A fact ingested from Claude is instantly recallable from Codex; a person stored via the CLI shows up in every MCP client. No syncing, no duplication.
+- **Persistent across sessions**: memories live in an on-disk SQLite file and survive restarts, CLI invocations, and MCP reconnects.
+- **One knowledge base across every MCP client**: Claude Code, Claude Desktop, Codex, OpenCode, and OpenClaw all point at the same `~/.memory39/memory39.db`. A fact stored from Claude is instantly recallable from Codex; a person stored via the CLI shows up in every MCP client. No syncing, no duplication.
 - **Local and private**: no cloud, no account, no telemetry. Your memory is a single SQLite file on your machine that you can inspect, back up, or move by copying.
 - **Single binary, zero daemon**: CLI for scripting (`memory39 recall ...`), MCP server on demand (`memory39 mcp`). Nothing runs in the background between calls.
 - **Portable DB path**: point at a different database by exporting `MEMORY39_DB=/path/to/other.db` (supports `~/` expansion). Useful for project-scoped memory or isolated benchmarks.
@@ -27,10 +29,21 @@ How it works:
 - **Unigrams + bigrams** - every memory field is tokenized into individual words and adjacent-word pairs, all stored in the bloom filter. A query for `"alice berlin"` checks both tokens and the `alice+berlin` bigram.
 - **Unicode-normalized** - tokens are lowercased with diacritics removed (matching FTS5's `unicode61 remove_diacritics 2`), so `café` and `cafe` hit the same entry.
 - **Prefix-safe** - long tokens (>6 chars) that FTS5 would prefix-expand are never skipped, avoiding false negatives.
-- **Persisted** - the bloom filter is saved to `<db>.bloom` alongside the database and loaded on startup. Rebuilt automatically after bulk `ingest` operations.
+- **Persisted** - the bloom filter is saved to `<db>.bloom` alongside the database and loaded on startup. Rebuilt automatically after bulk writes.
 - **Zero false negatives** - if a token exists in any memory, the bloom filter always says "maybe". It can only produce false positives (saying "maybe" when nothing matches), which just fall through to FTS5 as usual.
 
 Configured for 600K items at 0.001% false positive rate.
+
+### Measured cost
+
+Numbers from a personal DB (~300 memories, 144 KB SQLite file):
+
+| Query | Path | Avg per call | Throughput |
+|-------|------|-------------:|-----------:|
+| Unknown fact | Bloom says "no match possible"; no disk I/O | **~120 ns** | ~8.5M ops/sec |
+| Known fact | Bloom says "maybe" -> FTS5 search runs | ~245 us | ~4K ops/sec |
+
+Negative queries are **~2000x faster** than positive ones. "Nanoseconds, in-memory" is literal: a bloom check is a handful of hash probes into a bitmap sitting in L1/L2 cache.
 
 ## Install
 
@@ -70,72 +83,8 @@ Every memory has `importance` (0-10), `emotion`, and `tags`. The prefix + rowid 
 |------|---------|-------------|
 | `--db <path>` | `memory39.db` | SQLite database file |
 | `--ram` | off | In-memory database (non-persistent) |
-| `--llm <provider>` | `deepseek` | LLM provider for `ingest` |
-| `--model <name>` | per-provider | Override default model |
 
 ### Commands
-
-#### `ingest` - LLM-driven fact extraction
-
-Reads a conversation and uses an LLM agent loop (up to 10 tool-calling rounds per chunk) to automatically extract and store memories. The LLM decides what type each fact is (event, thing, person, place), checks for duplicates via `recall`, and uses `alter`/`forget` to keep existing memories up to date.
-
-**Input format:** plain text, passed inline or via stdin. The chunker auto-detects conversation structure by recognizing actor prefixes:
-
-| Prefix pattern | Detected as |
-|----------------|-------------|
-| `User:`, `Human:`, `Customer:` | user turn |
-| `Assistant:`, `Agent:`, `Bot:`, `AI:` | agent turn |
-| `[...] User:`, `[...] Human:` | timestamped user turn |
-| `[...] Assistant:`, `[...] Agent:` | timestamped agent turn |
-| `Speaker_A:`, `Speaker_1:` | user turn |
-| `Speaker_B:`, `Speaker_2:` | agent turn |
-
-Conversations are split into ~8K-char chunks on actor switches (every 2 switches or when size limit is reached). Plain text without actor prefixes is treated as a single chunk.
-
-```bash
-# From stdin (any text format)
-cat conversation.txt | memory39 ingest -
-
-# Inline
-memory39 ingest "Alice said she's moving to Berlin in March"
-
-# Chat logs, transcripts, meeting notes - all work
-cat slack_export.txt | memory39 ingest - --llm groq
-```
-
-**What gets extracted:**
-
-| Memory type | Stored when the fact has... | Example |
-|-------------|----------------------------|---------|
-| Event (dated) | A specific date or time | "Alice joined the team in March" |
-| Event (undated) | Temporal context but no date | "They met last year at a conference" |
-| Person | Attributes about someone | "Alice is a backend engineer" |
-| Place | A location | "The office is on 5th Ave" |
-| Thing | Knowledge, preferences, facts | "We use Python for the backend" |
-
-**Importance scale assigned by the LLM:**
-
-| Range | Level | Example |
-|-------|-------|---------|
-| 1-2 | Trivia | Offhand remarks, small talk |
-| 3-4 | Context | Background details, mild preferences |
-| 5-6 | Factual | Job, skills, tools, team info |
-| 7-8 | Actionable | Allergies, deadlines, decisions |
-| 9-10 | Critical | Emergencies, key life events |
-
-| Flag | Description |
-|------|-------------|
-| `--llm <provider>` | `deepseek` (default), `groq`, `openai`, `ollama` |
-| `--model <name>` | Override model (e.g. `--model gpt-4o`) |
-
-**LLM Provider Defaults:**
-
-| Provider | Default Model | API Key Env Var |
-|----------|---------------|-----------------|
-| `deepseek` | `deepseek-chat` | `DEEPSEEK_API_KEY` |
-| `groq` | `llama-3.3-70b-versatile` | `GROQ_API_KEY` |
-| `openai` | `gpt-4o-mini` | `OPENAI_API_KEY` |
-| `ollama` | `llama3.2` | none (local) |
 
 #### `event` - Store an event
 
@@ -271,7 +220,7 @@ memory39 alter T2 --text "Updated fact" --importance 8
 
 ## MCP Server
 
-`memory39 mcp` starts the MCP server (STDIO transport). The `ingest` command is excluded; only direct database operations are available. **No LLM API keys are needed to run the MCP server**, since the LLM is only used by `ingest`.
+`memory39 mcp` starts the MCP server (STDIO transport). It runs purely against the local SQLite database: no network calls, no API keys, no external services.
 
 Database path: `~/.memory39/memory39.db` (auto-created). This path is **shared across every MCP client on the machine**, so configuring memory39 in Claude Code, Claude Desktop, Codex, OpenCode, and OpenClaw gives all of them the same memory. Override with `MEMORY39_DB=/path/to/other.db` for project-scoped or isolated databases.
 
@@ -331,24 +280,11 @@ All tools use the same universal ID system:
 
 ## Environment
 
-**LLM API keys are only required for the `ingest` command.** Everything else (every other CLI command: `event`, `thing`, `person`, `place`, `recall`, `connect`, `forget`, `alter`, and the entire MCP server) runs purely against the local SQLite database and needs no keys, no network, and no `.env` file.
+memory39 has **no external dependencies at runtime**: no network, no API keys, no `.env` file. The only environment variable it reads is an optional DB-path override.
 
 | Variable | Used by | Purpose |
 |----------|---------|---------|
 | `MEMORY39_DB` | MCP server | Override DB path (supports leading `~/`). Default: `~/.memory39/memory39.db`. For the CLI, use the `--db` flag instead. |
-| `DEEPSEEK_API_KEY` | `ingest` only | DeepSeek API key |
-| `GROQ_API_KEY` | `ingest` only | Groq API key |
-| `OPENAI_API_KEY` | `ingest` only | OpenAI API key |
-
-If (and only if) you plan to use `ingest`, create a `.env` file with the key for the provider you want:
-
-```bash
-DEEPSEEK_API_KEY=sk-...
-GROQ_API_KEY=gsk_...
-OPENAI_API_KEY=sk-...
-```
-
-Using a local model with `--llm ollama` requires no API key at all.
 
 ## Built With
 

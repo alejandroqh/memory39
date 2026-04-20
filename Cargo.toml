@@ -1,8 +1,8 @@
 [package]
 name = "memory39"
-version = "1.0.1"
+version = "1.0.3"
 edition = "2024"
-description = "Temporal-priority memory system for AI agents"
+description = "Single-binary, single-file, local memory shared by every MCP client."
 authors = ["Alejandro Quintanar"]
 license = "Apache-2.0"
 repository = "https://github.com/alejandroqh/memory39"
@@ -35,7 +35,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 turbomcp = "3"
 dirs = "6"

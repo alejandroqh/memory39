@@ -173,7 +173,7 @@ impl MemoryDb {
         &self.conn
     }
 
-    /// Rebuild bloom filter from DB (for bulk operations like ingest)
+    /// Rebuild bloom filter from DB (for bulk writes).
     pub fn rebuild_bloom(&mut self) {
         self.bloom = build_bloom(&self.conn);
         self.bloom_dirty = false;
