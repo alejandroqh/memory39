@@ -61,7 +61,7 @@ cargo install memory39
 Installs the binary and auto-configures it for every MCP client detected: **Claude Code**, **Claude Desktop**, **Codex**, **OpenCode**, **OpenClaw**.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/alejandroqh/marketplace/main/h39.sh | sh
+curl -fsSL https://raw.githubusercontent.com/alejandroqh/marketplace/main/h39.sh | bash
 ```
 
 Single binary: CLI by default, MCP server with `memory39 mcp`.
