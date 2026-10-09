@@ -315,4 +315,20 @@ CREATE TRIGGER IF NOT EXISTS places_au AFTER UPDATE ON places BEGIN
     INSERT INTO places_fts(rowid, name, desc, address, kind, note, tags, emotion)
     VALUES (new.id, new.name, new.desc, new.address, new.kind, new.note, new.tags, new.emotion);
 END;
+
+-- Write generation: bumped on every INSERT/UPDATE by any writer (any process, any version).
+-- The persisted bloom filter records the generation it was built for; a mismatch means stale.
+-- DELETE does not bump: forgetting leaves the bloom a valid superset.
+CREATE TABLE IF NOT EXISTS write_gen (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL);
+INSERT OR IGNORE INTO write_gen (id, n) VALUES (1, 0);
+CREATE TRIGGER IF NOT EXISTS events_gen_ai AFTER INSERT ON events BEGIN UPDATE write_gen SET n = n + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS events_gen_au AFTER UPDATE ON events BEGIN UPDATE write_gen SET n = n + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS events_undated_gen_ai AFTER INSERT ON events_undated BEGIN UPDATE write_gen SET n = n + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS events_undated_gen_au AFTER UPDATE ON events_undated BEGIN UPDATE write_gen SET n = n + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS things_gen_ai AFTER INSERT ON things BEGIN UPDATE write_gen SET n = n + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS things_gen_au AFTER UPDATE ON things BEGIN UPDATE write_gen SET n = n + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS persons_gen_ai AFTER INSERT ON persons BEGIN UPDATE write_gen SET n = n + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS persons_gen_au AFTER UPDATE ON persons BEGIN UPDATE write_gen SET n = n + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS places_gen_ai AFTER INSERT ON places BEGIN UPDATE write_gen SET n = n + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS places_gen_au AFTER UPDATE ON places BEGIN UPDATE write_gen SET n = n + 1 WHERE id = 1; END;
 ";

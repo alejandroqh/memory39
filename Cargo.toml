@@ -1,6 +1,6 @@
 [package]
 name = "memory39"
-version = "1.0.3"
+version = "2.0.0"
 edition = "2024"
 description = "Single-binary, single-file, local memory shared by every MCP client."
 authors = ["Alejandro Quintanar"]

@@ -1,6 +1,8 @@
 use bloomfilter::Bloom;
 use rusqlite::{Connection, Result};
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use unicode_normalization::UnicodeNormalization;
 
 use super::crud;
@@ -11,11 +13,22 @@ use super::schema::{has_fts5_operators, PREFIX_MIN_LEN};
 const BLOOM_ITEMS_ESTIMATE: usize = 600_000;
 const BLOOM_FP_RATE: f64 = 0.00001;
 
+// On-disk layout: magic | format version (u32 LE) | write_gen (i64 LE) | bloom bytes
+const BLOOM_MAGIC: &[u8; 8] = b"M39BLOOM";
+const BLOOM_FORMAT_VERSION: u32 = 1;
+const BLOOM_HEADER_LEN: usize = 8 + 4 + 8;
+
+struct BloomState {
+    bloom: Bloom<String>,
+    /// `write_gen` of the DB state the bloom covers; -1 = unknown, forces a sync
+    write_gen: i64,
+}
+
 pub struct MemoryDb {
     conn: Connection,
-    bloom: Bloom<String>,
+    // RefCell: recall (&self) must refresh the bloom when other connections wrote
+    state: RefCell<BloomState>,
     bloom_path: Option<PathBuf>,
-    bloom_dirty: bool,
 }
 
 // --- Tokenization (matches FTS5 unicode61 remove_diacritics 2) ---
@@ -34,19 +47,9 @@ fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn bigrams(tokens: &[String]) -> Vec<String> {
-    tokens.windows(2)
-        .map(|pair| format!("{}+{}", pair[0], pair[1]))
-        .collect()
-}
-
 fn add_text_to_bloom(bloom: &mut Bloom<String>, text: &str) {
-    let tokens = tokenize(text);
-    for t in &tokens {
-        bloom.set(t);
-    }
-    for bg in bigrams(&tokens) {
-        bloom.set(&bg);
+    for t in tokenize(text) {
+        bloom.set(&t);
     }
 }
 
@@ -65,37 +68,14 @@ fn should_skip_fts(bloom: &Bloom<String>, query: &str) -> bool {
         return false;
     }
 
-    let tokens = tokenize(query);
-    if tokens.is_empty() {
-        return false;
-    }
-
-    // If ALL tokens are absent AND none would be prefix-expanded → skip
-    let mut can_skip = true;
-    for token in &tokens {
-        if token.chars().count() > PREFIX_MIN_LEN {
-            // Would be prefix-expanded; bloom can't model prefixes
-            can_skip = false;
-            break;
-        }
-        if bloom.check(token) {
-            can_skip = false;
-            break;
-        }
-    }
-    if can_skip {
-        return true;
-    }
-
-    // For multi-word queries: if ALL bigrams are absent → skip
-    if tokens.len() >= 2 {
-        let bgs = bigrams(&tokens);
-        if bgs.iter().all(|bg| !bloom.check(bg)) {
-            return true;
-        }
-    }
-
-    false
+    // FTS5 ANDs query words (any order, any column), so one absent word rules out
+    // a match. Words longer than PREFIX_MIN_LEN are prefix-expanded by the fallback
+    // pass (same split as expand_query_for_prefix); the bloom can't model prefixes,
+    // so they never decide.
+    query.split_whitespace()
+        .filter(|word| word.chars().count() <= PREFIX_MIN_LEN)
+        .flat_map(tokenize)
+        .any(|token| !bloom.check(&token))
 }
 
 // --- Bloom filter persistence ---
@@ -109,13 +89,45 @@ fn new_bloom() -> Bloom<String> {
         .expect("invalid bloom filter parameters")
 }
 
-fn load_bloom(path: &Path) -> Option<Bloom<String>> {
-    let data = std::fs::read(path).ok()?;
-    Bloom::from_bytes(data).ok()
+fn read_write_gen(conn: &Connection) -> Result<i64> {
+    conn.prepare_cached("SELECT n FROM write_gen WHERE id = 1")?
+        .query_row([], |row| row.get(0))
 }
 
-fn save_bloom(bloom: &Bloom<String>, path: &Path) {
-    let _ = std::fs::write(path, bloom.to_bytes());
+/// Load a persisted bloom and the `write_gen` it was built for.
+/// Rejects unknown formats, including the headerless pre-1.0.4 layout.
+fn load_bloom(path: &Path) -> Option<(Bloom<String>, i64)> {
+    let data = std::fs::read(path).ok()?;
+    if data.len() < BLOOM_HEADER_LEN || &data[..8] != BLOOM_MAGIC {
+        return None;
+    }
+    let version = u32::from_le_bytes(data[8..12].try_into().ok()?);
+    if version != BLOOM_FORMAT_VERSION {
+        return None;
+    }
+    let write_gen = i64::from_le_bytes(data[12..20].try_into().ok()?);
+    let bloom = Bloom::from_bytes(data[BLOOM_HEADER_LEN..].to_vec()).ok()?;
+    Some((bloom, write_gen))
+}
+
+/// Replace the persisted bloom atomically (temp file + rename) so concurrent
+/// readers never see a torn file.
+fn save_bloom(bloom: &Bloom<String>, write_gen: i64, path: &Path) {
+    static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let bytes = bloom.to_bytes();
+    let mut data = Vec::with_capacity(BLOOM_HEADER_LEN + bytes.len());
+    data.extend_from_slice(BLOOM_MAGIC);
+    data.extend_from_slice(&BLOOM_FORMAT_VERSION.to_le_bytes());
+    data.extend_from_slice(&write_gen.to_le_bytes());
+    data.extend_from_slice(&bytes);
+
+    let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("bloom.tmp.{}.{}", std::process::id(), seq));
+    let saved = std::fs::write(&tmp, &data).is_ok() && std::fs::rename(&tmp, path).is_ok();
+    if !saved {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 fn scan_table(bloom: &mut Bloom<String>, conn: &Connection, sql: &str, col_count: usize) {
@@ -131,14 +143,41 @@ fn scan_table(bloom: &mut Bloom<String>, conn: &Connection, sql: &str, col_count
     }
 }
 
-fn build_bloom(conn: &Connection) -> Bloom<String> {
+/// Build from the DB. Reads `write_gen` and scans in one read transaction (or the
+/// caller's), so the returned generation matches exactly the rows scanned.
+fn build_bloom(conn: &Connection) -> Result<(Bloom<String>, i64)> {
+    let tx = if conn.is_autocommit() { Some(conn.unchecked_transaction()?) } else { None };
+    let write_gen = read_write_gen(conn)?;
     let mut bloom = new_bloom();
     scan_table(&mut bloom, conn, "SELECT event, note, tags, emotion, location, people FROM events", 6);
     scan_table(&mut bloom, conn, "SELECT event, note, tags, emotion, location, people FROM events_undated", 6);
     scan_table(&mut bloom, conn, "SELECT thing, desc, category, tags, emotion FROM things", 5);
     scan_table(&mut bloom, conn, "SELECT name, role, relationship, note, tags, emotion FROM persons", 6);
     scan_table(&mut bloom, conn, "SELECT name, desc, address, kind, note, tags, emotion FROM places", 7);
-    bloom
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
+    Ok((bloom, write_gen))
+}
+
+fn build_and_save(conn: &Connection, bloom_path: Option<&Path>) -> Result<(Bloom<String>, i64)> {
+    let (bloom, write_gen) = build_bloom(conn)?;
+    if let Some(p) = bloom_path {
+        save_bloom(&bloom, write_gen, p);
+    }
+    Ok((bloom, write_gen))
+}
+
+/// Use the persisted bloom if it was built for the DB's current `write_gen`,
+/// otherwise rebuild from the DB and persist.
+fn load_or_build(conn: &Connection, bloom_path: Option<&Path>) -> Result<(Bloom<String>, i64)> {
+    let db_gen = read_write_gen(conn)?;
+    if let Some((bloom, file_gen)) = bloom_path.and_then(load_bloom)
+        && file_gen == db_gen
+    {
+        return Ok((bloom, file_gen));
+    }
+    build_and_save(conn, bloom_path)
 }
 
 // --- MemoryDb implementation ---
@@ -146,54 +185,71 @@ fn build_bloom(conn: &Connection) -> Bloom<String> {
 impl MemoryDb {
     pub fn new(conn: Connection, db_path: Option<&Path>) -> Self {
         let bloom_path = db_path.map(bloom_path_for_db);
-
-        let bloom = bloom_path.as_ref()
-            .and_then(|p| load_bloom(p))
-            .unwrap_or_else(|| {
-                let b = build_bloom(&conn);
-                if let Some(p) = &bloom_path {
-                    save_bloom(&b, p);
-                }
-                b
-            });
-
-        MemoryDb { conn, bloom, bloom_path, bloom_dirty: false }
+        // On failure start unsynced: recall retries the sync and lets FTS5 decide meanwhile.
+        let (bloom, write_gen) = load_or_build(&conn, bloom_path.as_deref())
+            .unwrap_or_else(|_| (new_bloom(), -1));
+        MemoryDb { conn, state: RefCell::new(BloomState { bloom, write_gen }), bloom_path }
     }
 
     pub fn new_ram(conn: Connection) -> Self {
-        MemoryDb {
-            conn,
-            bloom: new_bloom(),
-            bloom_path: None,
-            bloom_dirty: false,
-        }
+        Self::new(conn, None)
     }
 
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
 
-    /// Rebuild bloom filter from DB (for bulk writes).
+    /// Rebuild bloom filter from DB and persist it.
     pub fn rebuild_bloom(&mut self) {
-        self.bloom = build_bloom(&self.conn);
-        self.bloom_dirty = false;
+        let state = self.state.get_mut();
+        (state.bloom, state.write_gen) = build_and_save(&self.conn, self.bloom_path.as_deref())
+            .unwrap_or_else(|_| (new_bloom(), -1));
+    }
+
+    /// No-op: the bloom is saved on every write. Kept for API compatibility.
+    pub fn flush(&mut self) {}
+
+    /// Catch up with writes this MemoryDb didn't make (other processes, other MCP
+    /// clients, older binaries): the `write_gen` triggers count them all.
+    fn sync(&self) -> Result<()> {
+        let db_gen = read_write_gen(&self.conn)?;
+        let mut state = self.state.borrow_mut();
+        if db_gen != state.write_gen {
+            (state.bloom, state.write_gen) = load_or_build(&self.conn, self.bloom_path.as_deref())?;
+        }
+        Ok(())
+    }
+
+    /// Run a write inside an IMMEDIATE transaction and add its text to the bloom.
+    /// The bloom file is saved only after COMMIT, so its `write_gen` label always
+    /// names a committed state.
+    fn write<T>(&mut self, texts: &[Option<&str>], op: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = self.write_locked(texts, op)
+            .and_then(|v| self.conn.execute_batch("COMMIT").map(|_| v));
+        let state = self.state.get_mut();
+        if result.is_err() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            // The in-memory bloom may describe a rolled-back state; force a re-sync.
+            state.write_gen = -1;
+            return result;
+        }
         if let Some(p) = &self.bloom_path {
-            save_bloom(&self.bloom, p);
+            save_bloom(&state.bloom, state.write_gen, p);
         }
+        result
     }
 
-    fn mark_dirty(&mut self) {
-        self.bloom_dirty = true;
-    }
-
-    /// Flush bloom to disk if dirty
-    pub fn flush(&mut self) {
-        if self.bloom_dirty {
-            if let Some(p) = &self.bloom_path {
-                save_bloom(&self.bloom, p);
-            }
-            self.bloom_dirty = false;
+    fn write_locked<T>(&mut self, texts: &[Option<&str>], op: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        // We hold the write lock, so after this sync nobody else can write until COMMIT.
+        self.sync()?;
+        let v = op(&self.conn)?;
+        let state = self.state.get_mut();
+        for t in texts {
+            add_field_to_bloom(&mut state.bloom, *t);
         }
+        state.write_gen = read_write_gen(&self.conn)?;
+        Ok(v)
     }
 
     // --- Delegate: recall with bloom pre-check ---
@@ -201,7 +257,8 @@ impl MemoryDb {
     pub fn recall(&self, query: &str, limit: usize, offset: usize, filters: &RecallFilters) -> Vec<RecallResult> {
         let q = query.trim();
         let is_wildcard = q.is_empty() || q == "*";
-        if !is_wildcard && should_skip_fts(&self.bloom, q) {
+        // If the bloom can't be brought up to date, skip the pre-check and let FTS5 decide.
+        if !is_wildcard && self.sync().is_ok() && should_skip_fts(&self.state.borrow().bloom, q) {
             return Vec::new();
         }
         recall::recall(&self.conn, query, limit, offset, filters)
@@ -222,13 +279,9 @@ impl MemoryDb {
         location: Option<&str>, people: Option<&str>, source: Option<&str>,
         created_at: &str,
     ) -> Result<i64> {
-        let id = crud::insert_event(&self.conn, event, datetime, note, tags, importance, emotion, location, people, source, created_at)?;
-        add_text_to_bloom(&mut self.bloom, event);
-        for f in [note, tags, emotion, location, people] {
-            add_field_to_bloom(&mut self.bloom, f);
-        }
-        self.mark_dirty();
-        Ok(id)
+        self.write(&[Some(event), note, tags, emotion, location, people], |conn| {
+            crud::insert_event(conn, event, datetime, note, tags, importance, emotion, location, people, source, created_at)
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -238,13 +291,9 @@ impl MemoryDb {
         source: Option<&str>, confidence: u8, related: Option<&str>,
         created_at: &str,
     ) -> Result<i64> {
-        let id = crud::insert_thing(&self.conn, thing, desc, category, tags, importance, emotion, source, confidence, related, created_at)?;
-        add_text_to_bloom(&mut self.bloom, thing);
-        for f in [desc, category, tags, emotion] {
-            add_field_to_bloom(&mut self.bloom, f);
-        }
-        self.mark_dirty();
-        Ok(id)
+        self.write(&[Some(thing), desc, category, tags, emotion], |conn| {
+            crud::insert_thing(conn, thing, desc, category, tags, importance, emotion, source, confidence, related, created_at)
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -254,13 +303,9 @@ impl MemoryDb {
         note: Option<&str>, tags: Option<&str>, importance: u8,
         emotion: Option<&str>, created_at: &str,
     ) -> Result<i64> {
-        let id = crud::insert_person(&self.conn, name, role, relationship, contact, met_at, last_seen, note, tags, importance, emotion, created_at)?;
-        add_text_to_bloom(&mut self.bloom, name);
-        for f in [role, relationship, note, tags, emotion] {
-            add_field_to_bloom(&mut self.bloom, f);
-        }
-        self.mark_dirty();
-        Ok(id)
+        self.write(&[Some(name), role, relationship, note, tags, emotion], |conn| {
+            crud::insert_person(conn, name, role, relationship, contact, met_at, last_seen, note, tags, importance, emotion, created_at)
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -269,38 +314,22 @@ impl MemoryDb {
         kind: Option<&str>, note: Option<&str>, tags: Option<&str>,
         importance: u8, emotion: Option<&str>, created_at: &str,
     ) -> Result<i64> {
-        let id = crud::insert_place(&self.conn, name, desc, address, kind, note, tags, importance, emotion, created_at)?;
-        add_text_to_bloom(&mut self.bloom, name);
-        for f in [desc, address, kind, note, tags, emotion] {
-            add_field_to_bloom(&mut self.bloom, f);
-        }
-        self.mark_dirty();
-        Ok(id)
+        self.write(&[Some(name), desc, address, kind, note, tags, emotion], |conn| {
+            crud::insert_place(conn, name, desc, address, kind, note, tags, importance, emotion, created_at)
+        })
     }
 
     // --- Delegate: alter with bloom update ---
 
     pub fn alter(&mut self, mid: &str, changes: &[(String, String)]) -> Result<bool> {
-        let result = crud::alter(&self.conn, mid, changes)?;
-        if result {
-            for (_, value) in changes {
-                add_text_to_bloom(&mut self.bloom, value);
-            }
-            self.mark_dirty();
-        }
-        Ok(result)
+        let texts: Vec<Option<&str>> = changes.iter().map(|(_, v)| Some(v.as_str())).collect();
+        self.write(&texts, |conn| crud::alter(conn, mid, changes))
     }
 
     // --- Delegate: forget (no bloom update needed) ---
 
     pub fn forget(&self, mid: &str) -> Result<bool> {
         crud::forget(&self.conn, mid)
-    }
-}
-
-impl Drop for MemoryDb {
-    fn drop(&mut self) {
-        self.flush();
     }
 }
 
@@ -321,6 +350,57 @@ mod tests {
         ").unwrap();
         conn.execute_batch(super::super::schema::SCHEMA).unwrap();
         MemoryDb::new_ram(conn)
+    }
+
+    fn skips(mdb: &MemoryDb, query: &str) -> bool {
+        should_skip_fts(&mdb.state.borrow().bloom, query)
+    }
+
+    fn no_filters() -> RecallFilters {
+        RecallFilters {
+            min_importance: None, date_from: None, date_to: None,
+            memory_type: None, source: None,
+        }
+    }
+
+    fn mids(results: &[RecallResult]) -> Vec<String> {
+        let mut ids: Vec<String> = results.iter().map(|r| r.mid.clone()).collect();
+        ids.sort();
+        ids
+    }
+
+    /// A DB file in its own temp dir, removed on drop.
+    struct TempDb {
+        dir: PathBuf,
+    }
+
+    impl TempDb {
+        fn new(name: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir()
+                .join(format!("memory39-{}-{}-{}", name, std::process::id(), nanos));
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDb { dir }
+        }
+
+        fn path(&self) -> PathBuf {
+            self.dir.join("test.db")
+        }
+
+        fn bloom_path(&self) -> PathBuf {
+            bloom_path_for_db(&self.path())
+        }
+
+        fn open(&self) -> MemoryDb {
+            super::super::open(&self.path()).unwrap()
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 
     // --- tokenization ---
@@ -347,21 +427,6 @@ mod tests {
     fn test_tokenize_empty() {
         assert!(tokenize("").is_empty());
         assert!(tokenize("   ").is_empty());
-    }
-
-    // --- bigrams ---
-
-    #[test]
-    fn test_bigrams() {
-        let tokens = tokenize("Saarland University campus");
-        let bgs = bigrams(&tokens);
-        assert_eq!(bgs, vec!["saarland+university", "university+campus"]);
-    }
-
-    #[test]
-    fn test_bigrams_single_word() {
-        let tokens = tokenize("hello");
-        assert!(bigrams(&tokens).is_empty());
     }
 
     // --- should_skip_fts ---
@@ -395,25 +460,27 @@ mod tests {
         // "desarrollando" (13 chars > PREFIX_MIN_LEN=6) → would be prefix-expanded
         // Bloom can't model prefix queries → must not skip
         assert!(!should_skip_fts(&bloom, "desarrollando"));
+        assert!(!should_skip_fts(&bloom, "desarrollando proyecto"));
     }
 
     #[test]
-    fn test_skip_via_bigram_absent() {
-        let mut bloom = new_bloom();
-        // Both words exist individually but bigram absent
-        bloom.set(&"alice".to_string());
-        bloom.set(&"berlin".to_string());
-        // "alice" present, "berlin" present, but "alice+berlin" bigram absent → skip
-        assert!(should_skip_fts(&bloom, "alice berlin"));
-    }
-
-    #[test]
-    fn test_no_skip_bigram_present() {
+    fn test_no_skip_all_words_present_any_order() {
         let mut bloom = new_bloom();
         bloom.set(&"alice".to_string());
         bloom.set(&"berlin".to_string());
-        bloom.set(&"alice+berlin".to_string());
+        // FTS5 matches words anywhere in the row, so adjacency doesn't matter
         assert!(!should_skip_fts(&bloom, "alice berlin"));
+        assert!(!should_skip_fts(&bloom, "berlin alice"));
+    }
+
+    #[test]
+    fn test_skip_one_short_word_absent() {
+        let mut bloom = new_bloom();
+        bloom.set(&"alice".to_string());
+        // Implicit AND: an absent short word rules out every row
+        assert!(should_skip_fts(&bloom, "alice zzz"));
+        // Even next to a long (prefix-expanded) word
+        assert!(should_skip_fts(&bloom, "desarrollando zzz"));
     }
 
     #[test]
@@ -432,12 +499,12 @@ mod tests {
             Some("research"), 7, None, Some("Saarbrücken"), None, None, &ts()).unwrap();
 
         // Individual tokens should be in bloom
-        assert!(!should_skip_fts(&mdb.bloom, "saarland"));
-        assert!(!should_skip_fts(&mdb.bloom, "research"));
+        assert!(!skips(&mdb, "saarland"));
+        assert!(!skips(&mdb, "research"));
         // Diacritics normalized: "Saarbrücken" → "saarbrucken"
-        assert!(!should_skip_fts(&mdb.bloom, "saarbrucken"));
+        assert!(!skips(&mdb, "saarbrucken"));
         // Absent token should skip
-        assert!(should_skip_fts(&mdb.bloom, "xyz"));
+        assert!(skips(&mdb, "xyz"));
     }
 
     #[test]
@@ -445,16 +512,12 @@ mod tests {
         let mut mdb = test_mdb();
         mdb.insert_thing("Rust programming", None, None, None, 5, None, None, 5, None, &ts()).unwrap();
 
-        let filters = RecallFilters {
-            min_importance: None, date_from: None, date_to: None,
-            memory_type: None, source: None,
-        };
         // Should find it
-        let results = mdb.recall("rust", 10, 0, &filters);
+        let results = mdb.recall("rust", 10, 0, &no_filters());
         assert!(!results.is_empty());
 
         // Should be skipped by bloom (no FTS query)
-        let results = mdb.recall("nonexistent", 10, 0, &filters);
+        let results = mdb.recall("nonexistent", 10, 0, &no_filters());
         assert!(results.is_empty());
     }
 
@@ -463,12 +526,8 @@ mod tests {
         let mut mdb = test_mdb();
         mdb.insert_thing("something", None, None, None, 5, None, None, 5, None, &ts()).unwrap();
 
-        let filters = RecallFilters {
-            min_importance: None, date_from: None, date_to: None,
-            memory_type: None, source: None,
-        };
         // Wildcard should always bypass bloom and return results
-        let results = mdb.recall("*", 10, 0, &filters);
+        let results = mdb.recall("*", 10, 0, &no_filters());
         assert!(!results.is_empty());
     }
 
@@ -477,11 +536,11 @@ mod tests {
         let mut mdb = test_mdb();
         mdb.insert_thing("old name", None, None, None, 5, None, None, 5, None, &ts()).unwrap();
 
-        assert!(should_skip_fts(&mdb.bloom, "qubit"));
+        assert!(skips(&mdb, "qubit"));
 
         mdb.alter("T1", &[("thing".into(), "qubit spin".into())]).unwrap();
 
-        assert!(!should_skip_fts(&mdb.bloom, "qubit"));
+        assert!(!skips(&mdb, "qubit"));
     }
 
     #[test]
@@ -489,12 +548,12 @@ mod tests {
         let mut mdb = test_mdb();
         mdb.insert_thing("unique term", None, None, None, 5, None, None, 5, None, &ts()).unwrap();
 
-        assert!(!should_skip_fts(&mdb.bloom, "unique"));
+        assert!(!skips(&mdb, "unique"));
 
         mdb.forget("T1").unwrap();
 
         // Token remains in bloom (benign false positive)
-        assert!(!should_skip_fts(&mdb.bloom, "unique"));
+        assert!(!skips(&mdb, "unique"));
     }
 
     #[test]
@@ -504,23 +563,20 @@ mod tests {
         crud::insert_event(&mdb.conn, "sneak insert", None, None, None, 5, None, None, None, None, &ts()).unwrap();
 
         // Bloom doesn't know about it
-        assert!(should_skip_fts(&mdb.bloom, "sneak"));
+        assert!(skips(&mdb, "sneak"));
 
         // Rebuild picks it up
         mdb.rebuild_bloom();
-        assert!(!should_skip_fts(&mdb.bloom, "sneak"));
+        assert!(!skips(&mdb, "sneak"));
     }
 
     #[test]
-    fn test_dirty_flag() {
-        let mut mdb = test_mdb();
-        assert!(!mdb.bloom_dirty);
+    fn test_recall_sees_write_that_bypassed_memorydb() {
+        let mdb = test_mdb();
+        crud::insert_event(&mdb.conn, "sneak insert", None, None, None, 5, None, None, None, None, &ts()).unwrap();
 
-        mdb.insert_thing("test", None, None, None, 5, None, None, 5, None, &ts()).unwrap();
-        assert!(mdb.bloom_dirty);
-
-        mdb.flush();
-        assert!(!mdb.bloom_dirty);
+        // write_gen trigger bumped, so recall re-syncs before the pre-check
+        assert!(!mdb.recall("sneak", 10, 0, &no_filters()).is_empty());
     }
 
     #[test]
@@ -532,9 +588,134 @@ mod tests {
         mdb.insert_person("Marie Curie", None, None, None, None, None, None, None, 5, None, &ts()).unwrap();
         mdb.insert_place("CERN", None, None, None, None, None, 5, None, &ts()).unwrap();
 
-        assert!(!should_skip_fts(&mdb.bloom, "talk"));
-        assert!(!should_skip_fts(&mdb.bloom, "curie"));
-        assert!(!should_skip_fts(&mdb.bloom, "cern"));
-        assert!(should_skip_fts(&mdb.bloom, "nope"));
+        assert!(!skips(&mdb, "talk"));
+        assert!(!skips(&mdb, "curie"));
+        assert!(!skips(&mdb, "cern"));
+        assert!(skips(&mdb, "nope"));
+    }
+
+    // --- multi-word queries ---
+
+    fn seed_multiword(mdb: &mut MemoryDb) {
+        mdb.insert_thing("Alice moved to Berlin last spring", None, None, None, 5, None, None, 5, None, &ts()).unwrap();
+        mdb.insert_thing("Berlin apartment", None, None, Some("alice"), 5, None, None, 5, None, &ts()).unwrap();
+        mdb.insert_thing("coffee shop on the corner", None, None, None, 5, None, None, 5, None, &ts()).unwrap();
+        mdb.insert_thing("red apple pie recipe", None, None, None, 5, None, None, 5, None, &ts()).unwrap();
+        mdb.insert_thing("desarrollar proyecto nuevo", None, None, None, 5, None, None, 5, None, &ts()).unwrap();
+        mdb.insert_person("Marie Curie", Some("physicist"), None, None, None, None,
+            Some("won two Nobel prizes"), None, 5, None, &ts()).unwrap();
+    }
+
+    #[test]
+    fn test_multiword_recall_any_order_any_field() {
+        let mut mdb = test_mdb();
+        seed_multiword(&mut mdb);
+
+        for q in [
+            "shop coffee",            // reordered
+            "alice berlin",           // non-adjacent, and split across fields
+            "curie physicist",        // name + role
+            "marie nobel",            // name + note
+            "red pie apple",          // 3 words reordered
+            "desarrollando proyecto", // prefix fallback
+        ] {
+            assert!(!mdb.recall(q, 10, 0, &no_filters()).is_empty(), "{q:?} should match");
+        }
+        assert!(mdb.recall("alice zzz", 10, 0, &no_filters()).is_empty());
+    }
+
+    #[test]
+    fn test_bloom_never_hides_fts_matches() {
+        let mut mdb = test_mdb();
+        seed_multiword(&mut mdb);
+        mdb.insert_event("Met at Saarland University", None, None,
+            Some("research"), 7, None, Some("Saarbrücken"), None, None, &ts()).unwrap();
+        let docs = [
+            "café résumé",
+            "Straße in München",
+            "हिंदी भाषा सीखना",
+            "مَرْحَبًا بالعالم",
+            "東京タワー 旅行",
+            "don't stop rock-n-roll",
+            "Ünïcödé Plaza",
+        ];
+        for d in docs {
+            mdb.insert_thing(d, None, None, None, 5, None, None, 5, None, &ts()).unwrap();
+        }
+
+        // Every word, every reversed doc, plus hand-picked cross-field and miss cases
+        let mut queries: Vec<String> = vec![
+            "saarbrucken research", "cafe resume", "resume cafe", "munchen strasse",
+            "मरहब", "مرحبا", "رحب", "rock n roll", "don't", "unicode plaza", "plaza zzz",
+            "zzz", "alice zzz", "हिंदी zzz",
+        ].into_iter().map(String::from).collect();
+        for d in docs.iter().copied().chain(["Alice moved to Berlin last spring", "Marie Curie physicist"]) {
+            let words: Vec<&str> = d.split_whitespace().collect();
+            queries.extend(words.iter().map(|w| w.to_string()));
+            queries.push(words.iter().rev().copied().collect::<Vec<_>>().join(" "));
+        }
+
+        for q in &queries {
+            let with_bloom = mids(&mdb.recall(q, 50, 0, &no_filters()));
+            let fts_only = mids(&recall::recall(&mdb.conn, q, 50, 0, &no_filters()));
+            assert_eq!(with_bloom, fts_only, "bloom changed results for {q:?}");
+        }
+    }
+
+    // --- persistence and cross-process freshness ---
+
+    #[test]
+    fn test_sees_writes_from_other_connection() {
+        let tmp = TempDb::new("other-conn");
+        let a = tmp.open();
+        let mut b = tmp.open();
+        assert!(a.recall("kiwi", 10, 0, &no_filters()).is_empty());
+
+        b.insert_thing("kiwi farm", None, None, None, 5, None, None, 5, None, &ts()).unwrap();
+
+        assert!(!a.recall("kiwi", 10, 0, &no_filters()).is_empty());
+    }
+
+    #[test]
+    fn test_bloom_saved_on_write_not_on_exit() {
+        let tmp = TempDb::new("killed");
+        let mut a = tmp.open();
+        a.insert_thing("plum tart", None, None, None, 5, None, None, 5, None, &ts()).unwrap();
+        // A killed process never runs destructors
+        std::mem::forget(a);
+
+        let (file_bloom, file_gen) = load_bloom(&tmp.bloom_path()).expect("bloom file written");
+        assert!(!should_skip_fts(&file_bloom, "plum"));
+
+        let b = tmp.open();
+        assert_eq!(file_gen, read_write_gen(b.conn()).unwrap(), "file is current, no rebuild needed");
+        assert!(!b.recall("plum", 10, 0, &no_filters()).is_empty());
+    }
+
+    #[test]
+    fn test_external_writer_invalidates_bloom() {
+        let tmp = TempDb::new("external");
+        let mut a = tmp.open();
+        a.insert_thing("seed entry", None, None, None, 5, None, None, 5, None, &ts()).unwrap();
+
+        // An old binary or the sqlite3 shell: writes the DB, never touches the bloom file
+        let raw = Connection::open(tmp.path()).unwrap();
+        crud::insert_thing(&raw, "zinc mine", None, None, None, 5, None, None, 5, None, &ts()).unwrap();
+
+        assert!(!a.recall("zinc", 10, 0, &no_filters()).is_empty());
+        assert!(!tmp.open().recall("zinc", 10, 0, &no_filters()).is_empty());
+    }
+
+    #[test]
+    fn test_old_format_bloom_file_rebuilt() {
+        let tmp = TempDb::new("old-format");
+        tmp.open().insert_thing("quartz", None, None, None, 5, None, None, 5, None, &ts()).unwrap();
+
+        // Pre-1.0.4 layout: raw bloom bytes, no header, missing "quartz"
+        std::fs::write(tmp.bloom_path(), new_bloom().to_bytes()).unwrap();
+
+        assert!(!tmp.open().recall("quartz", 10, 0, &no_filters()).is_empty());
+        let data = std::fs::read(tmp.bloom_path()).unwrap();
+        assert_eq!(&data[..8], BLOOM_MAGIC);
     }
 }

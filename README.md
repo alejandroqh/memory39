@@ -22,33 +22,33 @@ Results are ranked by temporal-priority scoring: **0.4 x relevance + 0.3 x impor
 
 ## Performance
 
-memory39 uses a **bloom filter** as a pre-check layer before FTS5 queries. On every `recall`, the bloom filter tests whether the query tokens exist anywhere in the database - if they definitely don't, the FTS5 query is skipped entirely, returning zero results in **O(1)** with no disk I/O.
+memory39 uses a **bloom filter** as a pre-check layer before FTS5 queries. On every `recall`, the bloom filter tests whether the query words exist anywhere in the database. If any of them definitely doesn't, no memory can match, so the FTS5 query is skipped entirely and zero results come back in **O(1)** without touching the full-text index.
 
 | Layer | When it runs | Cost |
 |-------|-------------|------|
-| Bloom filter | Every `recall` query | ~nanoseconds, in-memory |
+| Bloom filter | Every `recall` query | ~1-2 us: one cached freshness read + hash probes |
 | FTS5 search | Only if bloom says "maybe" | Full-text index scan |
 
 How it works:
 
-- **Unigrams + bigrams** - every memory field is tokenized into individual words and adjacent-word pairs, all stored in the bloom filter. A query for `"alice berlin"` checks both tokens and the `alice+berlin` bigram.
+- **Word-level, order-free** - every indexed memory field is tokenized into words stored in the bloom filter. FTS5 matches query words in any order and in any field, so the bloom filter does too: `"alice berlin"` is skipped only if `alice` or `berlin` appears in no memory at all.
 - **Unicode-normalized** - tokens are lowercased with diacritics removed (matching FTS5's `unicode61 remove_diacritics 2`), so `café` and `cafe` hit the same entry.
-- **Prefix-safe** - long tokens (>6 chars) that FTS5 would prefix-expand are never skipped, avoiding false negatives.
-- **Persisted** - the bloom filter is saved to `<db>.bloom` alongside the database and loaded on startup. Rebuilt automatically after bulk writes.
-- **Zero false negatives** - if a token exists in any memory, the bloom filter always says "maybe". It can only produce false positives (saying "maybe" when nothing matches), which just fall through to FTS5 as usual.
+- **Prefix-safe** - long words (>6 chars) that FTS5 would prefix-expand never decide a skip, avoiding false negatives.
+- **Persisted and always fresh** - the bloom filter is saved to `<db>.bloom` on every new memory (not on exit, so a killed MCP server loses nothing) and loaded on startup. SQLite triggers keep a write counter that counts every insert and update from any process: other MCP clients, the CLI, even older memory39 versions. The file records the counter value it was built for and every `recall` checks it, so a stale bloom filter is reloaded or rebuilt automatically instead of hiding new memories.
+- **Zero false negatives** - if a word exists in any memory, the bloom filter always says "maybe". It can only produce false positives (saying "maybe" when nothing matches), which just fall through to FTS5 as usual.
 
 Configured for 600K items at 0.001% false positive rate.
 
 ### Measured cost
 
-Numbers from a personal DB (~300 memories, 144 KB SQLite file):
+Numbers from `cargo run --release --example bloom_bench` on a synthetic DB (~300 memories):
 
 | Query | Path | Avg per call | Throughput |
 |-------|------|-------------:|-----------:|
-| Unknown fact | Bloom says "no match possible"; no disk I/O | **~120 ns** | ~8.5M ops/sec |
-| Known fact | Bloom says "maybe" -> FTS5 search runs | ~245 us | ~4K ops/sec |
+| Unknown fact | Bloom says "no match possible"; FTS5 skipped | **~1.7 us** | ~590K ops/sec |
+| Known fact | Bloom says "maybe" -> FTS5 search runs | ~300 us | ~3.4K ops/sec |
 
-Negative queries are **~2000x faster** than positive ones. "Nanoseconds, in-memory" is literal: a bloom check is a handful of hash probes into a bitmap sitting in L1/L2 cache.
+Negative queries are **~175x faster** than positive ones. Most of the negative-path cost is the freshness check (a single-row read of the write counter, served from SQLite's page cache); the bloom probes themselves take ~150 ns.
 
 ## Install
 
