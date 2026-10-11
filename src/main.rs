@@ -10,9 +10,9 @@ use std::path::PathBuf;
     about = "Single-binary, single-file, local memory shared by every MCP client."
 )]
 struct Cli {
-    /// Path to SQLite database file
-    #[arg(long, default_value = "memory39.db")]
-    db: PathBuf,
+    /// Path to SQLite database file [default: $MEMORY39_DB, else ~/.memory39/memory39.db]
+    #[arg(long)]
+    db: Option<PathBuf>,
 
     /// Use in-memory database (for benchmarks/testing, not persistent)
     #[arg(long)]
@@ -22,6 +22,8 @@ struct Cli {
     command: Command,
 }
 
+// Parsed once per run; `Alter`'s many optional fields don't matter for size.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Store an event (something that happened or will happen). Omit date for undated events
@@ -129,10 +131,13 @@ enum Command {
         /// New primary text (event text for E/U, thing text for T, name for P/L)
         #[arg(long)]
         text: Option<String>,
-        /// New note
+        /// New note (E/U/P/L; on things T it sets the description)
         #[arg(long)]
         note: Option<String>,
-        /// New tags
+        /// New description (things T, places L)
+        #[arg(long)]
+        desc: Option<String>,
+        /// New comma-separated tags
         #[arg(long)]
         tags: Option<String>,
         /// New importance 0-10
@@ -141,25 +146,55 @@ enum Command {
         /// New emotion
         #[arg(long)]
         emotion: Option<String>,
-        /// New location
-        #[arg(long)]
-        location: Option<String>,
-        /// New people
-        #[arg(long)]
-        people: Option<String>,
-        /// New source
+        /// New source (events E/U, things T)
         #[arg(long)]
         source: Option<String>,
-        /// New date (YYYY-MM-DD), only for dated events
+        /// New location (events E/U only)
+        #[arg(long)]
+        location: Option<String>,
+        /// New people, comma-separated (events E/U only)
+        #[arg(long)]
+        people: Option<String>,
+        /// New date YYYY-MM-DD (dated events E only)
         #[arg(long)]
         date: Option<String>,
-        /// New time (HH:MM), only for dated events
+        /// New time HH:MM (dated events E only, requires --date)
         #[arg(long)]
         time: Option<String>,
+        /// New category (things T only)
+        #[arg(long)]
+        category: Option<String>,
+        /// New certainty 0-10 (things T only)
+        #[arg(long)]
+        confidence: Option<u8>,
+        /// New comma-separated related concepts (things T only)
+        #[arg(long)]
+        related: Option<String>,
+        /// New role or title (persons P only)
+        #[arg(long)]
+        role: Option<String>,
+        /// New relationship: friend, colleague, family, etc. (persons P only)
+        #[arg(long)]
+        relationship: Option<String>,
+        /// New contact info: email, phone, handle (persons P only)
+        #[arg(long)]
+        contact: Option<String>,
+        /// New where or when you met them (persons P only)
+        #[arg(long)]
+        met_at: Option<String>,
+        /// New last interaction date YYYY-MM-DD (persons P only)
+        #[arg(long)]
+        last_seen: Option<String>,
+        /// New address or coordinates (places L only)
+        #[arg(long)]
+        address: Option<String>,
+        /// New type: city, building, room, outdoor, virtual, etc. (places L only)
+        #[arg(long)]
+        kind: Option<String>,
     },
     /// Search across all memories
     Recall {
-        /// Search query
+        /// Search keywords. Every word must match; use OR to match any ("budget OR savings"). "*" lists all
         query: String,
         /// Max results to return
         #[arg(short, long, default_value = "10")]
@@ -227,6 +262,20 @@ enum Command {
     },
 }
 
+/// Report a failed command on stderr and exit non-zero, so scripts can tell.
+fn fail(msg: &str) -> ! {
+    eprintln!("{}", msg);
+    std::process::exit(1);
+}
+
+/// Bad memory IDs and fields come back as `InvalidParameterName`; show just their message.
+fn db_error(e: &rusqlite::Error) -> String {
+    match e {
+        rusqlite::Error::InvalidParameterName(msg) => msg.clone(),
+        other => other.to_string(),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -239,7 +288,8 @@ async fn main() {
     let mut db = if cli.ram {
         db::open_ram().expect("failed to open in-memory database")
     } else {
-        db::open(&cli.db).expect("failed to open database")
+        let path = db::resolve_path(cli.db.as_deref()).expect("failed to resolve database path");
+        db::open(&path).expect("failed to open database")
     };
 
     match cli.command {
@@ -304,49 +354,46 @@ async fn main() {
         Command::Forget { id } => {
             match db.forget(&id) {
                 Ok(true) => println!("Forgotten: {}", id),
-                Ok(false) => println!("Not found: {}", id),
-                Err(e) => eprintln!("Error: {}", e),
+                Ok(false) => fail(&format!("Not found: {}", id)),
+                Err(e) => fail(&format!("Error: {}", db_error(&e))),
             }
         }
         Command::Alter {
             id,
             text,
             note,
+            desc,
             tags,
             importance,
             emotion,
+            source,
             location,
             people,
-            source,
             date,
             time,
+            category,
+            confidence,
+            related,
+            role,
+            relationship,
+            contact,
+            met_at,
+            last_seen,
+            address,
+            kind,
         } => {
-            let mut changes: Vec<(String, String)> = Vec::new();
-            if let Some(v) = text {
-                changes.push((db::text_field_for_id(&id).into(), v));
-            }
-            if let Some(v) = note { changes.push(("note".into(), v)); }
-            if let Some(v) = tags { changes.push(("tags".into(), v)); }
-            if let Some(v) = importance { changes.push(("importance".into(), v.to_string())); }
-            if let Some(v) = emotion { changes.push(("emotion".into(), v)); }
-            if let Some(v) = location { changes.push(("location".into(), v)); }
-            if let Some(v) = people { changes.push(("people".into(), v)); }
-            if let Some(v) = source { changes.push(("source".into(), v)); }
-            if let Some(d) = &date {
-                let t = time.as_deref().unwrap_or("00:00");
-                changes.push(("datetime".into(), format!("{} {}", d, t)));
-            } else if time.is_some() {
-                eprintln!("Warning: --time without --date ignored (need both to update datetime)");
-            }
-
+            let fields = db::AlterFields {
+                text, note, desc, tags, importance, emotion, source, location, people, date, time,
+                category, confidence, related, role, relationship, contact, met_at, last_seen, address, kind,
+            };
+            let changes = db::alter_changes(&id, fields).unwrap_or_else(|e| fail(&format!("Error: {}", e)));
             if changes.is_empty() {
-                println!("Nothing to alter. Provide at least one field to change.");
-            } else {
-                match db.alter(&id, &changes) {
-                    Ok(true) => println!("Altered: {}", id),
-                    Ok(false) => println!("Not found: {}", id),
-                    Err(e) => eprintln!("Error: {}", e),
-                }
+                fail("Nothing to alter. Provide at least one field to change.");
+            }
+            match db.alter(&id, &changes) {
+                Ok(true) => println!("Altered: {}", id),
+                Ok(false) => fail(&format!("Not found: {}", id)),
+                Err(e) => fail(&format!("Error: {}", db_error(&e))),
             }
         }
         Command::Recall { query, limit, min, from, to, kind, source, offset } => {

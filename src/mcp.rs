@@ -5,7 +5,7 @@ use turbomcp::prelude::*;
 // Compile-time check: MCP server version must match Cargo.toml
 const _: () = {
     let cargo = env!("CARGO_PKG_VERSION").as_bytes();
-    let mcp = b"2.0.0";
+    let mcp = b"2.1.0";
     assert!(cargo.len() == mcp.len(), "MCP server version does not match Cargo.toml — update #[server(version)] below");
     let mut i = 0;
     while i < cargo.len() {
@@ -25,9 +25,18 @@ impl Memory39 {
     }
 }
 
+/// Bad memory IDs and fields are the caller's fault: report them as invalid params
+/// so the model can correct itself. Anything else is a server-side failure.
+fn db_error(e: rusqlite::Error) -> McpError {
+    match e {
+        rusqlite::Error::InvalidParameterName(msg) => McpError::invalid_params(msg),
+        other => McpError::internal(other.to_string()),
+    }
+}
+
 #[server(
     name = "memory39",
-    version = "2.0.0",
+    version = "2.1.0",
     description = "Single-binary, single-file, local memory shared by every MCP client."
 )]
 #[allow(clippy::too_many_arguments)]
@@ -38,7 +47,7 @@ impl Memory39 {
     #[tool]
     async fn recall(
         &self,
-        #[description("Search query (FTS5 syntax supported). Use '*' to list all memories")] query: String,
+        #[description("Search keywords (FTS5 syntax supported). Every word must match, so prefer a few distinctive keywords over a full sentence; use OR to match any (e.g. 'budget OR savings'). Use '*' to list all memories")] query: String,
         #[description("Max results to return (default 10, max 100)")] limit: Option<u64>,
         #[description("Minimum importance 0-10")] min_importance: Option<u8>,
         #[description("Date range start YYYY-MM-DD. Note: restricts results to events only")] from: Option<String>,
@@ -235,68 +244,56 @@ impl Memory39 {
         match mdb.forget(&id) {
             Ok(true) => Ok(format!("Forgotten: {}", id)),
             Ok(false) => Ok(format!("Not found: {}", id)),
-            Err(e) => Err(McpError::internal(e.to_string())),
+            Err(e) => Err(db_error(e)),
         }
     }
 
     /// Modify fields of an existing memory by its universal ID.
     /// Only provide fields you want to change; omit the rest.
+    /// Each field applies only to the memory types named in its description;
+    /// a field that doesn't apply returns an error listing the valid ones.
     #[tool]
     async fn alter(
         &self,
         #[description("Memory ID to modify (e.g. E3, U1, T2, P1, L4)")] id: String,
         #[description("New primary text (event text for E/U, thing text for T, name for P/L)")] text: Option<String>,
-        #[description("New note")] note: Option<String>,
-        #[description("New tags")] tags: Option<String>,
-        #[description("New importance 0-10")] importance: Option<u8>,
-        #[description("New emotion")] emotion: Option<String>,
-        #[description("New location (events only)")] location: Option<String>,
-        #[description("New people (events only)")] people: Option<String>,
-        #[description("New source")] source: Option<String>,
-        #[description("New date YYYY-MM-DD (dated events only)")] date: Option<String>,
-        #[description("New time HH:MM (dated events only, requires date)")] time: Option<String>,
+        #[description("New note (E/U/P/L; on things T it sets desc)")] note: Option<String>,
+        #[description("New description (things T, places L)")] desc: Option<String>,
+        #[description("New comma-separated tags (all types)")] tags: Option<String>,
+        #[description("New importance 0-10 (all types)")] importance: Option<u8>,
+        #[description("New emotion (all types)")] emotion: Option<String>,
+        #[description("New source (events E/U, things T)")] source: Option<String>,
+        #[description("New location (events E/U only)")] location: Option<String>,
+        #[description("New people, comma-separated (events E/U only)")] people: Option<String>,
+        #[description("New date YYYY-MM-DD (dated events E only)")] date: Option<String>,
+        #[description("New time HH:MM (dated events E only, requires date)")] time: Option<String>,
+        #[description("New category (things T only)")] category: Option<String>,
+        #[description("New certainty 0-10 (things T only)")] confidence: Option<u8>,
+        #[description("New comma-separated related concepts (things T only)")] related: Option<String>,
+        #[description("New role or title (persons P only)")] role: Option<String>,
+        #[description("New relationship: friend, colleague, family, etc. (persons P only)")] relationship: Option<String>,
+        #[description("New contact info: email, phone, handle (persons P only)")] contact: Option<String>,
+        #[description("New where or when you met them (persons P only)")] met_at: Option<String>,
+        #[description("New last interaction date YYYY-MM-DD (persons P only)")] last_seen: Option<String>,
+        #[description("New address or coordinates (places L only)")] address: Option<String>,
+        #[description("New type: city, building, room, outdoor, virtual, etc. (places L only)")] kind: Option<String>,
     ) -> McpResult<String> {
-        let mut changes: Vec<(String, String)> = Vec::new();
-        if let Some(v) = text {
-            changes.push((db::text_field_for_id(&id).into(), v));
-        }
-        if let Some(v) = note {
-            changes.push(("note".into(), v));
-        }
-        if let Some(v) = tags {
-            changes.push(("tags".into(), v));
-        }
-        if let Some(v) = importance {
-            changes.push(("importance".into(), v.to_string()));
-        }
-        if let Some(v) = emotion {
-            changes.push(("emotion".into(), v));
-        }
-        if let Some(v) = location {
-            changes.push(("location".into(), v));
-        }
-        if let Some(v) = people {
-            changes.push(("people".into(), v));
-        }
-        if let Some(v) = source {
-            changes.push(("source".into(), v));
-        }
-        if let Some(d) = &date {
-            let t = time.as_deref().unwrap_or("00:00");
-            changes.push(("datetime".into(), format!("{} {}", d, t)));
-        } else if time.is_some() {
-            return Err(McpError::invalid_params("Cannot set time without date. Provide both date and time together."));
-        }
+        let fields = db::AlterFields {
+            text, note, desc, tags, importance, emotion, source, location, people, date, time,
+            category, confidence, related, role, relationship, contact, met_at, last_seen, address, kind,
+        };
+        let changes = db::alter_changes(&id, fields).map_err(McpError::invalid_params)?;
         if changes.is_empty() {
             return Ok("Nothing to alter. Provide at least one field to change.".into());
         }
         let res = {
             let mut mdb = self.lock_db()?;
             mdb.alter(&id, &changes)
-        }; match res {
+        };
+        match res {
             Ok(true) => Ok(format!("Altered: {}", id)),
             Ok(false) => Ok(format!("Not found: {}", id)),
-            Err(e) => Err(McpError::internal(e.to_string())),
+            Err(e) => Err(db_error(e)),
         }
     }
 

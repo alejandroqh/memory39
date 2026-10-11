@@ -86,7 +86,7 @@ Every memory has `importance` (0-10), `emotion`, and `tags`. The prefix + rowid 
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--db <path>` | `memory39.db` | SQLite database file |
+| `--db <path>` | `$MEMORY39_DB`, else `~/.memory39/memory39.db` | SQLite database file (the same one every MCP client uses) |
 | `--ram` | off | In-memory database (non-persistent) |
 
 ### Commands
@@ -173,7 +173,7 @@ memory39 recall "*"  # list all
 
 | Arg/Flag | Required | Description |
 |----------|----------|-------------|
-| `<query>` | yes | FTS5 search query (`*` = all) |
+| `<query>` | yes | Search keywords; every word must match, so use a few distinctive words rather than a sentence. `OR` matches any (`budget OR savings`). FTS5 syntax supported; `*` = all |
 | `-l`, `--limit` | no | Max results (default 10) |
 | `--min` | no | Minimum importance 0-10 |
 | `--from` | no | Date start `YYYY-MM-DD` (events only) |
@@ -206,20 +206,37 @@ memory39 forget E3
 
 ```bash
 memory39 alter T2 --text "Updated fact" --importance 8
+memory39 alter T2 --desc "More detail" --confidence 9
+memory39 alter P1 --role "Staff engineer" --last-seen 2026-10-11
 ```
 
-| Flag | Description |
-|------|-------------|
-| `--text` | New primary text |
-| `--note` | New note |
-| `--tags` | New tags |
-| `--importance` | New importance 0-10 |
-| `--emotion` | New emotion |
-| `--location` | New location (events only) |
-| `--people` | New people (events only) |
-| `--source` | New source |
-| `--date` | New date (dated events only) |
-| `--time` | New time (requires `--date`) |
+| Flag | Applies to | Description |
+|------|------------|-------------|
+| `--text` | all | New primary text (event for `E`/`U`, thing for `T`, name for `P`/`L`) |
+| `--note` | all | New note; on things (`T`) it sets the description |
+| `--desc` | `T`, `L` | New description |
+| `--tags` | all | New comma-separated tags |
+| `--importance` | all | New importance 0-10 |
+| `--emotion` | all | New emotion |
+| `--source` | `E`, `U`, `T` | New source |
+| `--location` | `E`, `U` | New location |
+| `--people` | `E`, `U` | New people, comma-separated |
+| `--date` | `E` | New date `YYYY-MM-DD` |
+| `--time` | `E` | New time `HH:MM` (requires `--date`) |
+| `--category` | `T` | New category |
+| `--confidence` | `T` | New certainty 0-10 |
+| `--related` | `T` | New comma-separated related concepts |
+| `--role` | `P` | New role or title |
+| `--relationship` | `P` | New relationship |
+| `--contact` | `P` | New contact info |
+| `--met-at` | `P` | New where/when you met |
+| `--last-seen` | `P` | New last interaction `YYYY-MM-DD` |
+| `--address` | `L` | New address or coordinates |
+| `--kind` | `L` | New place type |
+
+A flag that doesn't apply to the memory's type is rejected with the list of valid fields. To date an undated event (`U#`), forget it and store it again with `--date`.
+
+`alter` and `forget` exit with status 1 when the memory is not found or the change is rejected, so scripts can detect failures.
 
 ---
 
@@ -289,7 +306,7 @@ memory39 has **no external dependencies at runtime**: no network, no API keys, n
 
 | Variable | Used by | Purpose |
 |----------|---------|---------|
-| `MEMORY39_DB` | MCP server | Override DB path (supports leading `~/`). Default: `~/.memory39/memory39.db`. For the CLI, use the `--db` flag instead. |
+| `MEMORY39_DB` | CLI and MCP server | Override DB path (supports leading `~/`). Default: `~/.memory39/memory39.db`. The CLI's `--db` flag takes precedence. |
 
 ## Built With
 

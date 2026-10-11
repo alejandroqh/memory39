@@ -1,5 +1,31 @@
 # Changelog
 
+## 2.1.0 (2026-10-11)
+
+### Upgrade notes
+
+- **The CLI now uses the shared database by default.** Without `--db` it opens `$MEMORY39_DB`, else `~/.memory39/memory39.db` (the same file the MCP server uses), instead of `memory39.db` in the current directory. If you kept memories in a local `memory39.db`, pass `--db memory39.db` to keep using it.
+- **`alter` and `forget` exit with status 1 on failure** (rejected change, malformed ID, memory not found, nothing to alter) and print the reason on stderr. They used to exit 0.
+- **`alter --time` without `--date` is now an error** in the CLI, as it already was over MCP. It used to print a warning and apply the other fields.
+- No on-disk changes. Library API (`memory39::db`) changes are additive: `AlterFields` and `alter_changes`.
+
+### Fixed
+
+- `alter` with `note` on a thing (`T#`) failed with `invalid field: note`. Things have no note column, so `note` now sets the thing's description.
+- A thing's or place's description could not be changed once stored. `alter` now takes `desc` (things and places).
+- `alter` now covers every field the database stores. New: `category`, `confidence`, `related` (things); `role`, `relationship`, `contact`, `met_at`, `last_seen` (persons, `--met-at` and `--last-seen` in the CLI); `address`, `kind` (places). These were write-once before.
+- A field that doesn't apply to the memory's type (`location` on a thing, `date` on a person) failed with a cryptic `Invalid parameter name: invalid field: ...`, sometimes naming a column the caller never used (`datetime`). The error now names the parameter, the memory type and the valid fields; `date` on an undated event also explains how to date it.
+- `alter t1 --text ...` (lowercase ID) failed with `invalid field: event`.
+- The CLI ignored `MEMORY39_DB` and defaulted to `memory39.db` in the current directory, so the CLI and MCP clients could silently write to different databases.
+- Over MCP, bad memory IDs and fields in `alter` and `forget` were reported as internal server errors. They are now `invalid_params`.
+
+### Changed
+
+- TurboMCP 3.0.14 → 3.6.0. Tool errors now reach the client as tool results (`isError: true`) with the message and an `io.turbomcp/errorKind` in `_meta`, instead of JSON-RPC errors, so models can read them and correct the call. Clients on protocol `2025-06-18` are served through version adapters. Includes upstream security fixes.
+- The CLI and the MCP server share one `alter` parameter mapping, and each parameter's help names the memory types it applies to.
+- `recall` documentation now says that every query word must match and that `OR` matches any of them.
+- Builds from source use the same release profile as the published binaries (strip, LTO, single codegen unit, abort on panic).
+
 ## 2.0.0 (2026-10-09)
 
 ### Upgrade notes
