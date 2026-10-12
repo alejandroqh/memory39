@@ -5,7 +5,7 @@ use turbomcp::prelude::*;
 // Compile-time check: MCP server version must match Cargo.toml
 const _: () = {
     let cargo = env!("CARGO_PKG_VERSION").as_bytes();
-    let mcp = b"2.1.0";
+    let mcp = b"2.5.0";
     assert!(cargo.len() == mcp.len(), "MCP server version does not match Cargo.toml — update #[server(version)] below");
     let mut i = 0;
     while i < cargo.len() {
@@ -36,7 +36,7 @@ fn db_error(e: rusqlite::Error) -> McpError {
 
 #[server(
     name = "memory39",
-    version = "2.1.0",
+    version = "2.5.0",
     description = "Single-binary, single-file, local memory shared by every MCP client."
 )]
 #[allow(clippy::too_many_arguments)]
@@ -47,7 +47,7 @@ impl Memory39 {
     #[tool]
     async fn recall(
         &self,
-        #[description("Search keywords (FTS5 syntax supported). Every word must match, so prefer a few distinctive keywords over a full sentence; use OR to match any (e.g. 'budget OR savings'). Use '*' to list all memories")] query: String,
+        #[description("Search keywords; prefer a few distinctive ones over a full sentence. Memories containing every word come first, then those containing most of them; word forms match automatically (house/houses, hablar/hablando). FTS5 syntax runs exactly as written, without these expansions: 'budget OR savings', '\"exact phrase\"', 'prefix*'. Use OR for synonyms and irregular forms (e.g. 'child OR children'). Use '*' to list all memories")] query: String,
         #[description("Max results to return (default 10, max 100)")] limit: Option<u64>,
         #[description("Minimum importance 0-10")] min_importance: Option<u8>,
         #[description("Date range start YYYY-MM-DD. Note: restricts results to events only")] from: Option<String>,

@@ -1,8 +1,13 @@
 use rusqlite::{Connection, Row};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use super::crud::memory_id;
-use super::schema::expand_query_for_prefix;
+use super::crud::{memory_id, parse_memory_id};
+use super::query::QueryPlan;
+use super::schema::has_fts5_operators;
+
+/// FTS candidates fetched per table for each result wanted, best bm25 first, so importance
+/// and recency rerank a wider pool than the final results.
+const CANDIDATES_PER_RESULT: usize = 4;
 
 pub struct RecallFilters {
     pub min_importance: Option<u8>,
@@ -16,13 +21,14 @@ pub struct RecallResult {
     pub memory_type: String,
     pub mid: String,
     pub score: f64,
+    /// Text relevance 0..1 from FTS5's bm25 rank (0 when listing with "*").
+    pub relevance: f64,
     pub fields: Vec<(String, String)>,
 }
 
 /// Search across all memory tables with composite scoring and filters.
 /// Score = 0.4 * relevance + 0.3 * importance + 0.3 * recency
-/// Uses two-phase query: exact match first, then prefix-expanded fallback for
-/// multilingual morphological variants (e.g. "desarrollando" → "desarr*").
+/// Plain words go through `recall_words`; a query in FTS5 syntax runs exactly as written.
 pub fn recall(conn: &Connection, query: &str, limit: usize, offset: usize, filters: &RecallFilters) -> Vec<RecallResult> {
     let query = query.trim();
     let is_wildcard = query.is_empty() || query == "*";
@@ -30,18 +36,12 @@ pub fn recall(conn: &Connection, query: &str, limit: usize, offset: usize, filte
 
     let mut results = if is_wildcard {
         recall_all_inner(conn, fetch, filters)
-    } else {
-        let mut results = recall_inner(conn, query, fetch, filters);
-        if results.len() < fetch
-            && let Some(expanded) = expand_query_for_prefix(query) {
-                let seen: HashSet<String> = results.iter().map(|r| r.mid.clone()).collect();
-                let mut extra = recall_inner(conn, &expanded, fetch, filters);
-                extra.retain(|r| !seen.contains(&r.mid));
-                results.extend(extra);
-                results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-                results.truncate(fetch);
-            }
+    } else if has_fts5_operators(query) {
+        let mut results = recall_inner(conn, query, fetch * CANDIDATES_PER_RESULT, filters);
+        results.truncate(fetch);
         results
+    } else {
+        recall_words(conn, query, fetch, filters)
     };
 
     if offset > 0 && offset < results.len() {
@@ -51,6 +51,87 @@ pub fn recall(conn: &Connection, query: &str, limit: usize, offset: usize, filte
     }
     results.truncate(limit);
     results
+}
+
+/// Plain words, in tiers that each fill only the slots the previous ones left:
+/// (1) every word as typed, (2) every word as typed or as a word form found in the index
+/// (house/houses, hablando/hablar), (3) at least half the words, most matched first, then
+/// by relevance alone: matching only common words ("the", "house") shouldn't win on importance.
+fn recall_words(conn: &Connection, query: &str, fetch: usize, filters: &RecallFilters) -> Vec<RecallResult> {
+    let plan = QueryPlan::new(conn, query);
+    if plan.is_empty() {
+        return Vec::new();
+    }
+    let candidates = fetch * CANDIDATES_PER_RESULT;
+
+    let mut results = recall_inner(conn, &plan.exact(), candidates, filters);
+    results.truncate(fetch);
+
+    if results.len() < fetch && plan.has_variants() {
+        let more = recall_inner(conn, &plan.all_words(), candidates, filters);
+        append_new(&mut results, more, fetch);
+    }
+
+    let n = plan.len();
+    if results.len() < fetch && n > 1 {
+        let candidates = recall_inner(conn, &plan.any_word(), candidates, filters);
+        let matched = matched_words(conn, &candidates, &plan.word_queries());
+        let mut partial: Vec<(usize, RecallResult)> = candidates.into_iter()
+            .map(|mut r| {
+                let matched = matched.get(&r.mid).copied().unwrap_or(0);
+                r.score *= matched as f64 / n as f64;
+                (matched, r)
+            })
+            .filter(|(matched, _)| *matched >= plan.min_matched())
+            .collect();
+        partial.sort_by(|a, b| b.0.cmp(&a.0)
+            .then(b.1.relevance.partial_cmp(&a.1.relevance).unwrap_or(std::cmp::Ordering::Equal)));
+        append_new(&mut results, partial.into_iter().map(|(_, r)| r).collect(), fetch);
+    }
+    results
+}
+
+/// How many of `word_queries` FTS5 matches in each result, by memory ID. Asking FTS5 keeps
+/// the count exact, which the bloom filter's skip rule relies on (see `QueryPlan::could_match`).
+fn matched_words(conn: &Connection, results: &[RecallResult], word_queries: &[String]) -> HashMap<String, usize> {
+    let mut ids_by_prefix: HashMap<String, Vec<i64>> = HashMap::new();
+    for r in results {
+        if let Some((prefix, id)) = parse_memory_id(&r.mid) {
+            ids_by_prefix.entry(prefix).or_default().push(id);
+        }
+    }
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for (prefix, ids) in &ids_by_prefix {
+        let Some(fts) = fts_table_for_prefix(prefix) else { continue };
+        let id_list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT rowid FROM {fts} WHERE {fts} MATCH ?1 AND rowid IN ({id_list})");
+        let Ok(mut stmt) = conn.prepare(&sql) else { continue };
+        for q in word_queries {
+            let Ok(rows) = stmt.query_map([q], |row| row.get::<_, i64>(0)) else { continue };
+            for id in rows.flatten() {
+                *counts.entry(memory_id(prefix, id)).or_default() += 1;
+            }
+        }
+    }
+    counts
+}
+
+fn fts_table_for_prefix(prefix: &str) -> Option<&'static str> {
+    match prefix {
+        "E" => Some("events_fts"),
+        "U" => Some("events_undated_fts"),
+        "T" => Some("things_fts"),
+        "P" => Some("persons_fts"),
+        "L" => Some("places_fts"),
+        _ => None,
+    }
+}
+
+/// Append results not already present, up to `fetch` in total.
+fn append_new(results: &mut Vec<RecallResult>, more: Vec<RecallResult>, fetch: usize) {
+    let seen: HashSet<String> = results.iter().map(|r| r.mid.clone()).collect();
+    let room = fetch.saturating_sub(results.len());
+    results.extend(more.into_iter().filter(|r| !seen.contains(&r.mid)).take(room));
 }
 
 /// Build filter WHERE clauses and params for recall queries.
@@ -87,7 +168,9 @@ fn build_recall_filters(
     (clauses, params)
 }
 
-fn recall_inner(conn: &Connection, query: &str, limit: usize, filters: &RecallFilters) -> Vec<RecallResult> {
+/// Run an FTS5 query on every table the filters allow: up to `candidates` best-ranked rows
+/// per table, sorted by composite score.
+fn recall_inner(conn: &Connection, query: &str, candidates: usize, filters: &RecallFilters) -> Vec<RecallResult> {
     let mut results = Vec::new();
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
 
@@ -101,8 +184,8 @@ fn recall_inner(conn: &Connection, query: &str, limit: usize, filters: &RecallFi
             "SELECT e.id, rank, e.event, e.datetime, e.note, e.tags, e.importance,
                     e.emotion, e.location, e.people, e.source, e.created_at
              FROM events_fts f JOIN events e ON e.id = f.rowid
-             WHERE events_fts MATCH ?1{} LIMIT ?2", fc);
-        let params = fts_params(query, limit, fp);
+             WHERE events_fts MATCH ?1{} ORDER BY rank LIMIT ?2", fc);
+        let params = fts_params(query, candidates, fp);
         recall_event_query(conn, &mut results, &sql, &params, true, &now);
     }
 
@@ -112,8 +195,8 @@ fn recall_inner(conn: &Connection, query: &str, limit: usize, filters: &RecallFi
             "SELECT u.id, rank, u.event, u.note, u.tags, u.importance,
                     u.emotion, u.location, u.people, u.source, u.created_at
              FROM events_undated_fts f JOIN events_undated u ON u.id = f.rowid
-             WHERE events_undated_fts MATCH ?1{} LIMIT ?2", fc);
-        let params = fts_params(query, limit, fp);
+             WHERE events_undated_fts MATCH ?1{} ORDER BY rank LIMIT ?2", fc);
+        let params = fts_params(query, candidates, fp);
         recall_event_query(conn, &mut results, &sql, &params, false, &now);
     }
 
@@ -127,8 +210,8 @@ fn recall_inner(conn: &Connection, query: &str, limit: usize, filters: &RecallFi
             "SELECT t.id, rank, t.thing, t.desc, t.category, t.tags, t.importance,
                     t.emotion, t.source, t.confidence, t.related, t.created_at
              FROM things_fts f JOIN things t ON t.id = f.rowid
-             WHERE things_fts MATCH ?1{} LIMIT ?2", fc);
-        let params = fts_params(query, limit, fp);
+             WHERE things_fts MATCH ?1{} ORDER BY rank LIMIT ?2", fc);
+        let params = fts_params(query, candidates, fp);
         recall_generic_query(conn, &mut results, &sql, &params, &now,
             "thing", "T", &["Thing", "Description", "Category", "Tags", "Importance",
                             "Emotion", "Source", "Confidence", "Related", "Stored"]);
@@ -140,8 +223,8 @@ fn recall_inner(conn: &Connection, query: &str, limit: usize, filters: &RecallFi
             "SELECT p.id, rank, p.name, p.role, p.relationship, p.contact, p.met_at,
                     p.last_seen, p.note, p.tags, p.importance, p.emotion, p.created_at
              FROM persons_fts f JOIN persons p ON p.id = f.rowid
-             WHERE persons_fts MATCH ?1{} LIMIT ?2", fc);
-        let params = fts_params(query, limit, fp);
+             WHERE persons_fts MATCH ?1{} ORDER BY rank LIMIT ?2", fc);
+        let params = fts_params(query, candidates, fp);
         recall_generic_query(conn, &mut results, &sql, &params, &now,
             "person", "P", &["Name", "Role", "Relationship", "Contact", "Met at",
                              "Last seen", "Note", "Tags", "Importance", "Emotion", "Stored"]);
@@ -153,15 +236,14 @@ fn recall_inner(conn: &Connection, query: &str, limit: usize, filters: &RecallFi
             "SELECT l.id, rank, l.name, l.desc, l.address, l.kind, l.note, l.tags,
                     l.importance, l.emotion, l.created_at
              FROM places_fts f JOIN places l ON l.id = f.rowid
-             WHERE places_fts MATCH ?1{} LIMIT ?2", fc);
-        let params = fts_params(query, limit, fp);
+             WHERE places_fts MATCH ?1{} ORDER BY rank LIMIT ?2", fc);
+        let params = fts_params(query, candidates, fp);
         recall_generic_query(conn, &mut results, &sql, &params, &now,
             "place", "L", &["Name", "Description", "Address", "Kind", "Note", "Tags",
                             "Importance", "Emotion", "Stored"]);
     }
 
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    results.truncate(limit);
     results
 }
 
@@ -334,11 +416,13 @@ fn recall_generic_query(
                 }
         }
 
-        let score = composite_score(fts_rank, importance, None, now);
+        let relevance = relevance(fts_rank);
+        let score = composite_score(relevance, importance, None, now);
         Ok(RecallResult {
             memory_type: mem_type.clone(),
             mid: memory_id(&pfx, id),
             score,
+            relevance,
             fields,
         })
     }) {
@@ -351,11 +435,13 @@ fn recall_generic_query(
     }
 }
 
-/// Composite score: 0.4 * relevance + 0.3 * importance_norm + 0.3 * recency
-fn composite_score(fts_rank: f64, importance: i64, datetime: Option<&str>, now: &str) -> f64 {
-    // FTS5 rank is negative (more negative = more relevant). Normalize to 0..1
-    let relevance = 1.0 / (1.0 + fts_rank.abs());
+/// FTS5 rank (bm25) is negative, more negative = more relevant. Map to 0..1, higher = more relevant.
+fn relevance(fts_rank: f64) -> f64 {
+    fts_rank.abs() / (1.0 + fts_rank.abs())
+}
 
+/// Composite score: 0.4 * relevance + 0.3 * importance_norm + 0.3 * recency
+fn composite_score(relevance: f64, importance: i64, datetime: Option<&str>, now: &str) -> f64 {
     // Importance normalized to 0..1
     let importance_norm = importance as f64 / 10.0;
 
@@ -425,12 +511,14 @@ fn build_event_result(row: &Row, dated: bool, now: &str) -> RecallResult {
             }
     }
 
-    let score = composite_score(fts_rank, importance, datetime.as_deref(), now);
+    let relevance = relevance(fts_rank);
+    let score = composite_score(relevance, importance, datetime.as_deref(), now);
     let prefix = if dated { "E" } else { "U" };
     RecallResult {
         memory_type: if dated { "event".into() } else { "event (undated)".into() },
         mid: memory_id(prefix, id),
         score,
+        relevance,
         fields,
     }
 }

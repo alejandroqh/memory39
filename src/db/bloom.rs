@@ -1,27 +1,57 @@
 use bloomfilter::Bloom;
 use rusqlite::{Connection, Result};
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use unicode_normalization::UnicodeNormalization;
 
 use super::crud;
+use super::query::{stem_key, stems, QueryPlan};
 use super::recall::{self, RecallFilters, RecallResult};
 use super::connect::{self, ConnectionResult};
-use super::schema::{has_fts5_operators, PREFIX_MIN_LEN};
+use super::schema::{has_fts5_operators, FTS_TABLES, FTS_TOKENIZER};
 
-const BLOOM_ITEMS_ESTIMATE: usize = 600_000;
-const BLOOM_FP_RATE: f64 = 0.00001;
+/// A bloom is sized for twice the keys it is built with (at least MIN_CAPACITY), and a write
+/// that fills it rebuilds it at the new size: few rebuilds, each about the size of the data.
+/// At capacity the false-positive rate is BLOOM_FP_RATE; a false positive only costs an FTS5 query.
+const MIN_CAPACITY: u64 = 20_000;
+const BLOOM_FP_RATE: f64 = 0.0001;
 
-// On-disk layout: magic | format version (u32 LE) | write_gen (i64 LE) | bloom bytes
+// On-disk layout: magic | format version (u32 LE) | write_gen (i64 LE) | keys (u64 LE)
+// | capacity (u64 LE) | bloom bytes (they carry their own size and hash count).
+// Version 2: FTS5's own terms plus their stems, sized to the data (version 1 held
+// Rust-tokenized words in a fixed 600K-item filter).
 const BLOOM_MAGIC: &[u8; 8] = b"M39BLOOM";
-const BLOOM_FORMAT_VERSION: u32 = 1;
-const BLOOM_HEADER_LEN: usize = 8 + 4 + 8;
+const BLOOM_FORMAT_VERSION: u32 = 2;
+const BLOOM_HEADER_LEN: usize = 8 + 4 + 8 + 8 + 8;
 
 struct BloomState {
     bloom: Bloom<String>,
+    /// Distinct keys set (terms and stem keys), counted as they are added
+    keys: u64,
+    /// Keys the bloom was sized for
+    capacity: u64,
     /// `write_gen` of the DB state the bloom covers; -1 = unknown, forces a sync
     write_gen: i64,
+}
+
+impl BloomState {
+    /// An empty bloom that covers no known DB state, so recall re-syncs before trusting it.
+    fn unsynced() -> Self {
+        BloomState { bloom: new_bloom(MIN_CAPACITY), keys: 0, capacity: MIN_CAPACITY, write_gen: -1 }
+    }
+
+    fn add_term(&mut self, term: &str) {
+        for key in keys_for(term) {
+            if !self.bloom.check_and_set(&key) {
+                self.keys += 1;
+            }
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.keys > self.capacity
+    }
 }
 
 pub struct MemoryDb {
@@ -31,51 +61,49 @@ pub struct MemoryDb {
     bloom_path: Option<PathBuf>,
 }
 
-// --- Tokenization (matches FTS5 unicode61 remove_diacritics 2) ---
+// --- Terms: exactly what the FTS5 index stores ---
 
-fn normalize_token(word: &str) -> String {
-    word.to_lowercase()
-        .nfd()
-        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
-        .collect()
+/// A scratch FTS5 table with the index's tokenizer, so new text is split into the same terms
+/// the index gets. Per connection, emptied after every use.
+fn create_term_tokenizer(conn: &Connection) -> Result<()> {
+    conn.execute_batch(&format!("
+        CREATE VIRTUAL TABLE IF NOT EXISTS temp.bloom_terms USING fts5(text, tokenize='{FTS_TOKENIZER}');
+        CREATE VIRTUAL TABLE IF NOT EXISTS temp.bloom_terms_vocab USING fts5vocab(temp, bloom_terms, row);
+    "))
 }
 
-fn tokenize(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .map(normalize_token)
-        .collect()
-}
-
-fn add_text_to_bloom(bloom: &mut Bloom<String>, text: &str) {
-    for t in tokenize(text) {
-        bloom.set(&t);
-    }
-}
-
-fn add_field_to_bloom(bloom: &mut Bloom<String>, field: Option<&str>) {
-    if let Some(text) = field
-        && !text.is_empty()
+/// FTS5's terms for `texts`, through the scratch table.
+fn fts5_terms(conn: &Connection, texts: &[Option<&str>]) -> Result<Vec<String>> {
     {
-        add_text_to_bloom(bloom, text);
+        let mut insert = conn.prepare_cached("INSERT INTO temp.bloom_terms(text) VALUES (?1)")?;
+        for text in texts.iter().flatten() {
+            insert.execute([text])?;
+        }
     }
+    let terms = conn.prepare_cached("SELECT term FROM temp.bloom_terms_vocab")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<String>>>()?;
+    conn.execute("DELETE FROM temp.bloom_terms", [])?;
+    Ok(terms)
+}
+
+/// Bloom keys for an indexed term: the term and its stems. A query word may match the term
+/// itself or, through `QueryPlan` variants, any indexed term with the same stem.
+fn keys_for(term: &str) -> Vec<String> {
+    std::iter::once(term.to_string())
+        .chain(stems(term).iter().map(|s| stem_key(s)))
+        .collect()
 }
 
 // --- Decision function ---
 
 fn should_skip_fts(bloom: &Bloom<String>, query: &str) -> bool {
+    // FTS5 syntax runs as written; phrases, prefixes and NOT aren't decided word by word
     if has_fts5_operators(query) {
         return false;
     }
-
-    // FTS5 ANDs query words (any order, any column), so one absent word rules out
-    // a match. Words longer than PREFIX_MIN_LEN are prefix-expanded by the fallback
-    // pass (same split as expand_query_for_prefix); the bloom can't model prefixes,
-    // so they never decide.
-    query.split_whitespace()
-        .filter(|word| word.chars().count() <= PREFIX_MIN_LEN)
-        .flat_map(tokenize)
-        .any(|token| !bloom.check(&token))
+    // Recall needs enough words matching, as typed or as a variant (see QueryPlan::could_match)
+    !QueryPlan::parse(query).could_match(|key| bloom.check(&key.to_string()))
 }
 
 // --- Bloom filter persistence ---
@@ -84,8 +112,8 @@ fn bloom_path_for_db(db_path: &Path) -> PathBuf {
     db_path.with_extension("bloom")
 }
 
-fn new_bloom() -> Bloom<String> {
-    Bloom::new_for_fp_rate(BLOOM_ITEMS_ESTIMATE, BLOOM_FP_RATE)
+fn new_bloom(capacity: u64) -> Bloom<String> {
+    Bloom::new_for_fp_rate(capacity as usize, BLOOM_FP_RATE)
         .expect("invalid bloom filter parameters")
 }
 
@@ -94,9 +122,9 @@ fn read_write_gen(conn: &Connection) -> Result<i64> {
         .query_row([], |row| row.get(0))
 }
 
-/// Load a persisted bloom and the `write_gen` it was built for.
-/// Rejects unknown formats, including the headerless pre-1.0.4 layout.
-fn load_bloom(path: &Path) -> Option<(Bloom<String>, i64)> {
+/// Load a persisted bloom. Rejects unknown formats, including version 1 and the
+/// headerless pre-1.0.4 layout.
+fn load_bloom(path: &Path) -> Option<BloomState> {
     let data = std::fs::read(path).ok()?;
     if data.len() < BLOOM_HEADER_LEN || &data[..8] != BLOOM_MAGIC {
         return None;
@@ -105,21 +133,26 @@ fn load_bloom(path: &Path) -> Option<(Bloom<String>, i64)> {
     if version != BLOOM_FORMAT_VERSION {
         return None;
     }
-    let write_gen = i64::from_le_bytes(data[12..20].try_into().ok()?);
+    let field = |at: usize| -> Option<[u8; 8]> { data[at..at + 8].try_into().ok() };
+    let write_gen = i64::from_le_bytes(field(12)?);
+    let keys = u64::from_le_bytes(field(20)?);
+    let capacity = u64::from_le_bytes(field(28)?);
     let bloom = Bloom::from_bytes(data[BLOOM_HEADER_LEN..].to_vec()).ok()?;
-    Some((bloom, write_gen))
+    Some(BloomState { bloom, keys, capacity, write_gen })
 }
 
 /// Replace the persisted bloom atomically (temp file + rename) so concurrent
 /// readers never see a torn file.
-fn save_bloom(bloom: &Bloom<String>, write_gen: i64, path: &Path) {
+fn save_bloom(state: &BloomState, path: &Path) {
     static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-    let bytes = bloom.to_bytes();
+    let bytes = state.bloom.to_bytes();
     let mut data = Vec::with_capacity(BLOOM_HEADER_LEN + bytes.len());
     data.extend_from_slice(BLOOM_MAGIC);
     data.extend_from_slice(&BLOOM_FORMAT_VERSION.to_le_bytes());
-    data.extend_from_slice(&write_gen.to_le_bytes());
+    data.extend_from_slice(&state.write_gen.to_le_bytes());
+    data.extend_from_slice(&state.keys.to_le_bytes());
+    data.extend_from_slice(&state.capacity.to_le_bytes());
     data.extend_from_slice(&bytes);
 
     let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -130,52 +163,46 @@ fn save_bloom(bloom: &Bloom<String>, write_gen: i64, path: &Path) {
     }
 }
 
-fn scan_table(bloom: &mut Bloom<String>, conn: &Connection, sql: &str, col_count: usize) {
-    if let Ok(mut stmt) = conn.prepare(sql) {
-        let _ = stmt.query_map([], |row| {
-            for i in 0..col_count {
-                if let Ok(v) = row.get::<_, String>(i) {
-                    add_field_to_bloom(bloom, Some(&v));
-                }
-            }
-            Ok(())
-        }).map(|rows| rows.for_each(|_| {}));
-    }
-}
-
-/// Build from the DB. Reads `write_gen` and scans in one read transaction (or the
-/// caller's), so the returned generation matches exactly the rows scanned.
-fn build_bloom(conn: &Connection) -> Result<(Bloom<String>, i64)> {
+/// Build from the index's own terms (the fts5vocab views in SCHEMA), sized for twice its keys.
+/// Reads `write_gen` and the terms in one read transaction (or the caller's), so the
+/// generation matches exactly.
+fn build_bloom(conn: &Connection) -> Result<BloomState> {
     let tx = if conn.is_autocommit() { Some(conn.unchecked_transaction()?) } else { None };
     let write_gen = read_write_gen(conn)?;
-    let mut bloom = new_bloom();
-    scan_table(&mut bloom, conn, "SELECT event, note, tags, emotion, location, people FROM events", 6);
-    scan_table(&mut bloom, conn, "SELECT event, note, tags, emotion, location, people FROM events_undated", 6);
-    scan_table(&mut bloom, conn, "SELECT thing, desc, category, tags, emotion FROM things", 5);
-    scan_table(&mut bloom, conn, "SELECT name, role, relationship, note, tags, emotion FROM persons", 6);
-    scan_table(&mut bloom, conn, "SELECT name, desc, address, kind, note, tags, emotion FROM places", 7);
+    let mut keys: HashSet<String> = HashSet::new();
+    for (fts, _) in FTS_TABLES {
+        let mut stmt = conn.prepare(&format!("SELECT term FROM temp.{fts}_vocab"))?;
+        for term in stmt.query_map([], |row| row.get::<_, String>(0))? {
+            keys.extend(keys_for(&term?));
+        }
+    }
     if let Some(tx) = tx {
         tx.commit()?;
     }
-    Ok((bloom, write_gen))
+    let capacity = (2 * keys.len() as u64).max(MIN_CAPACITY);
+    let mut bloom = new_bloom(capacity);
+    for key in &keys {
+        bloom.set(key);
+    }
+    Ok(BloomState { bloom, keys: keys.len() as u64, capacity, write_gen })
 }
 
-fn build_and_save(conn: &Connection, bloom_path: Option<&Path>) -> Result<(Bloom<String>, i64)> {
-    let (bloom, write_gen) = build_bloom(conn)?;
+fn build_and_save(conn: &Connection, bloom_path: Option<&Path>) -> Result<BloomState> {
+    let state = build_bloom(conn)?;
     if let Some(p) = bloom_path {
-        save_bloom(&bloom, write_gen, p);
+        save_bloom(&state, p);
     }
-    Ok((bloom, write_gen))
+    Ok(state)
 }
 
 /// Use the persisted bloom if it was built for the DB's current `write_gen`,
 /// otherwise rebuild from the DB and persist.
-fn load_or_build(conn: &Connection, bloom_path: Option<&Path>) -> Result<(Bloom<String>, i64)> {
+fn load_or_build(conn: &Connection, bloom_path: Option<&Path>) -> Result<BloomState> {
     let db_gen = read_write_gen(conn)?;
-    if let Some((bloom, file_gen)) = bloom_path.and_then(load_bloom)
-        && file_gen == db_gen
+    if let Some(state) = bloom_path.and_then(load_bloom)
+        && state.write_gen == db_gen
     {
-        return Ok((bloom, file_gen));
+        return Ok(state);
     }
     build_and_save(conn, bloom_path)
 }
@@ -185,10 +212,12 @@ fn load_or_build(conn: &Connection, bloom_path: Option<&Path>) -> Result<(Bloom<
 impl MemoryDb {
     pub fn new(conn: Connection, db_path: Option<&Path>) -> Self {
         let bloom_path = db_path.map(bloom_path_for_db);
+        // Without it writes can't extract terms and mark the bloom stale instead (see write_locked)
+        let _ = create_term_tokenizer(&conn);
         // On failure start unsynced: recall retries the sync and lets FTS5 decide meanwhile.
-        let (bloom, write_gen) = load_or_build(&conn, bloom_path.as_deref())
-            .unwrap_or_else(|_| (new_bloom(), -1));
-        MemoryDb { conn, state: RefCell::new(BloomState { bloom, write_gen }), bloom_path }
+        let state = load_or_build(&conn, bloom_path.as_deref())
+            .unwrap_or_else(|_| BloomState::unsynced());
+        MemoryDb { conn, state: RefCell::new(state), bloom_path }
     }
 
     pub fn new_ram(conn: Connection) -> Self {
@@ -199,11 +228,10 @@ impl MemoryDb {
         &self.conn
     }
 
-    /// Rebuild bloom filter from DB and persist it.
+    /// Rebuild bloom filter from DB, sized to its current terms, and persist it.
     pub fn rebuild_bloom(&mut self) {
-        let state = self.state.get_mut();
-        (state.bloom, state.write_gen) = build_and_save(&self.conn, self.bloom_path.as_deref())
-            .unwrap_or_else(|_| (new_bloom(), -1));
+        *self.state.get_mut() = build_and_save(&self.conn, self.bloom_path.as_deref())
+            .unwrap_or_else(|_| BloomState::unsynced());
     }
 
     /// No-op: the bloom is saved on every write. Kept for API compatibility.
@@ -215,7 +243,7 @@ impl MemoryDb {
         let db_gen = read_write_gen(&self.conn)?;
         let mut state = self.state.borrow_mut();
         if db_gen != state.write_gen {
-            (state.bloom, state.write_gen) = load_or_build(&self.conn, self.bloom_path.as_deref())?;
+            *state = load_or_build(&self.conn, self.bloom_path.as_deref())?;
         }
         Ok(())
     }
@@ -235,7 +263,7 @@ impl MemoryDb {
             return result;
         }
         if let Some(p) = &self.bloom_path {
-            save_bloom(&state.bloom, state.write_gen, p);
+            save_bloom(state, p);
         }
         result
     }
@@ -244,11 +272,25 @@ impl MemoryDb {
         // We hold the write lock, so after this sync nobody else can write until COMMIT.
         self.sync()?;
         let v = op(&self.conn)?;
+        let terms = fts5_terms(&self.conn, texts);
         let state = self.state.get_mut();
-        for t in texts {
-            add_field_to_bloom(&mut state.bloom, *t);
+        match terms {
+            Ok(terms) => {
+                for t in &terms {
+                    state.add_term(t);
+                }
+                state.write_gen = read_write_gen(&self.conn)?;
+                // Full: rebuild at twice the keys. Inside this write's transaction, so the new
+                // bloom includes the write. If it fails the full one stays: more false positives only.
+                if state.is_full()
+                    && let Ok(bigger) = build_bloom(&self.conn)
+                {
+                    *state = bigger;
+                }
+            }
+            // The write stands; the bloom just misses it, so mark it stale and rebuild on recall
+            Err(_) => state.write_gen = -1,
         }
-        state.write_gen = read_write_gen(&self.conn)?;
         Ok(v)
     }
 
@@ -403,51 +445,31 @@ mod tests {
         }
     }
 
-    // --- tokenization ---
-
-    #[test]
-    fn test_tokenize_basic() {
-        let tokens = tokenize("Saarland University");
-        assert_eq!(tokens, vec!["saarland", "university"]);
-    }
-
-    #[test]
-    fn test_tokenize_diacritics() {
-        let tokens = tokenize("café résumé");
-        assert_eq!(tokens, vec!["cafe", "resume"]);
-    }
-
-    #[test]
-    fn test_tokenize_punctuation() {
-        let tokens = tokenize("hello, world! foo-bar");
-        assert_eq!(tokens, vec!["hello", "world", "foo", "bar"]);
-    }
-
-    #[test]
-    fn test_tokenize_empty() {
-        assert!(tokenize("").is_empty());
-        assert!(tokenize("   ").is_empty());
-    }
-
     // --- should_skip_fts ---
+
+    /// A bloom holding `terms` and their stems, as built from an index with those terms.
+    fn bloom_with(terms: &[&str]) -> Bloom<String> {
+        let mut state = BloomState::unsynced();
+        for t in terms {
+            state.add_term(t);
+        }
+        state.bloom
+    }
 
     #[test]
     fn test_skip_absent_tokens() {
-        let bloom = new_bloom();
         // Empty bloom → all tokens absent → skip
-        assert!(should_skip_fts(&bloom, "xyz abc"));
+        assert!(should_skip_fts(&bloom_with(&[]), "xyz abc"));
     }
 
     #[test]
     fn test_no_skip_present_token() {
-        let mut bloom = new_bloom();
-        bloom.set(&"hello".to_string());
-        assert!(!should_skip_fts(&bloom, "hello"));
+        assert!(!should_skip_fts(&bloom_with(&["hello"]), "hello"));
     }
 
     #[test]
     fn test_no_skip_fts5_operators() {
-        let bloom = new_bloom();
+        let bloom = bloom_with(&[]);
         assert!(!should_skip_fts(&bloom, "\"exact phrase\""));
         assert!(!should_skip_fts(&bloom, "hello*"));
         assert!(!should_skip_fts(&bloom, "a AND b"));
@@ -455,37 +477,46 @@ mod tests {
     }
 
     #[test]
-    fn test_no_skip_long_word_prefix_expansion() {
-        let bloom = new_bloom();
-        // "desarrollando" (13 chars > PREFIX_MIN_LEN=6) → would be prefix-expanded
-        // Bloom can't model prefix queries → must not skip
+    fn test_no_skip_word_forms() {
+        // Recall matches indexed terms with the same stem, so their stems count as present
+        let bloom = bloom_with(&["car", "desarrollo", "universe"]);
+        assert!(!should_skip_fts(&bloom, "cars"));
         assert!(!should_skip_fts(&bloom, "desarrollando"));
-        assert!(!should_skip_fts(&bloom, "desarrollando proyecto"));
+        assert!(!should_skip_fts(&bloom, "university"), "a stemmer conflation recall also makes");
+        assert!(should_skip_fts(&bloom, "transportation"), "long words decide too");
     }
 
     #[test]
     fn test_no_skip_all_words_present_any_order() {
-        let mut bloom = new_bloom();
-        bloom.set(&"alice".to_string());
-        bloom.set(&"berlin".to_string());
+        let bloom = bloom_with(&["alice", "berlin"]);
         // FTS5 matches words anywhere in the row, so adjacency doesn't matter
         assert!(!should_skip_fts(&bloom, "alice berlin"));
         assert!(!should_skip_fts(&bloom, "berlin alice"));
     }
 
     #[test]
-    fn test_skip_one_short_word_absent() {
-        let mut bloom = new_bloom();
-        bloom.set(&"alice".to_string());
-        // Implicit AND: an absent short word rules out every row
-        assert!(should_skip_fts(&bloom, "alice zzz"));
-        // Even next to a long (prefix-expanded) word
-        assert!(should_skip_fts(&bloom, "desarrollando zzz"));
+    fn test_skip_needs_less_than_half_the_words() {
+        let bloom = bloom_with(&["alice"]);
+        // Recall returns memories with at least half the words
+        assert!(!should_skip_fts(&bloom, "alice zzz"));
+        assert!(should_skip_fts(&bloom, "alice zzz qqq"));
+        assert!(should_skip_fts(&bloom, "alice berlin zzz qqq"), "1 of 4 is less than half");
+        assert!(!should_skip_fts(&bloom_with(&["alice", "berlin"]), "alice berlin zzz qqq"));
+    }
+
+    #[test]
+    fn test_no_skip_words_fts5_folds_differently() {
+        // Outside ASCII and single-accent Latin letters, FTS5 may fold unlike Rust: never decide
+        let bloom = bloom_with(&[]);
+        for q in ["straße", "københavn", "λόγος", "東京", "ſtreet"] {
+            assert!(!should_skip_fts(&bloom, q), "{q:?}");
+        }
+        assert!(should_skip_fts(&bloom, "café"), "é folds the same in both");
     }
 
     #[test]
     fn test_skip_empty_query() {
-        let bloom = new_bloom();
+        let bloom = bloom_with(&[]);
         assert!(!should_skip_fts(&bloom, ""));
         assert!(!should_skip_fts(&bloom, "   "));
     }
@@ -498,13 +529,27 @@ mod tests {
         mdb.insert_event("Met at Saarland University", None, None,
             Some("research"), 7, None, Some("Saarbrücken"), None, None, &ts()).unwrap();
 
-        // Individual tokens should be in bloom
         assert!(!skips(&mdb, "saarland"));
         assert!(!skips(&mdb, "research"));
-        // Diacritics normalized: "Saarbrücken" → "saarbrucken"
+        // Diacritics folded by FTS5: "Saarbrücken" → "saarbrucken"
         assert!(!skips(&mdb, "saarbrucken"));
-        // Absent token should skip
+        assert!(!skips(&mdb, "Saarbrücken"));
+        // Word forms of stored terms
+        assert!(!skips(&mdb, "universities"));
         assert!(skips(&mdb, "xyz"));
+    }
+
+    #[test]
+    fn test_bloom_holds_fts5_terms() {
+        let mut mdb = test_mdb();
+        // Decomposed accent (u + U+0308): FTS5 indexes "mude", a Rust split would give "mu" + "de"
+        mdb.insert_thing("mu\u{308}de", None, None, None, 5, None, None, 5, None, &ts()).unwrap();
+        // FTS5 folds long s to s
+        mdb.insert_thing("\u{17f}treet", None, None, None, 5, None, None, 5, None, &ts()).unwrap();
+        for q in ["mude", "müde", "street"] {
+            assert!(!skips(&mdb, q), "{q:?}");
+            assert_eq!(mdb.recall(q, 10, 0, &no_filters()).len(), 1, "{q:?}");
+        }
     }
 
     #[test]
@@ -517,6 +562,7 @@ mod tests {
         assert!(!results.is_empty());
 
         // Should be skipped by bloom (no FTS query)
+        assert!(skips(&mdb, "nonexistent"));
         let results = mdb.recall("nonexistent", 10, 0, &no_filters());
         assert!(results.is_empty());
     }
@@ -565,9 +611,10 @@ mod tests {
         // Bloom doesn't know about it
         assert!(skips(&mdb, "sneak"));
 
-        // Rebuild picks it up
+        // Rebuild picks it up, word forms included
         mdb.rebuild_bloom();
         assert!(!skips(&mdb, "sneak"));
+        assert!(!skips(&mdb, "inserts"));
     }
 
     #[test]
@@ -577,6 +624,16 @@ mod tests {
 
         // write_gen trigger bumped, so recall re-syncs before the pre-check
         assert!(!mdb.recall("sneak", 10, 0, &no_filters()).is_empty());
+    }
+
+    #[test]
+    fn test_write_without_term_tokenizer_marks_bloom_stale() {
+        let mut mdb = test_mdb();
+        mdb.conn.execute_batch("DROP TABLE temp.bloom_terms_vocab; DROP TABLE temp.bloom_terms;").unwrap();
+        // The write still succeeds; the bloom can't learn its terms, so it is rebuilt on recall
+        mdb.insert_thing("kiwi farm", None, None, None, 5, None, None, 5, None, &ts()).unwrap();
+        assert_eq!(mdb.state.borrow().write_gen, -1);
+        assert_eq!(mdb.recall("kiwi", 10, 0, &no_filters()).len(), 1);
     }
 
     #[test]
@@ -617,11 +674,14 @@ mod tests {
             "curie physicist",        // name + role
             "marie nobel",            // name + note
             "red pie apple",          // 3 words reordered
-            "desarrollando proyecto", // prefix fallback
+            "desarrollando proyecto", // word form
         ] {
             assert!(!mdb.recall(q, 10, 0, &no_filters()).is_empty(), "{q:?} should match");
         }
-        assert!(mdb.recall("alice zzz", 10, 0, &no_filters()).is_empty());
+        // Half the words matching is enough; less is skipped
+        assert_eq!(mids(&mdb.recall("alice zzz", 10, 0, &no_filters())), vec!["T1", "T2"]);
+        assert!(skips(&mdb, "alice zzz qqq"));
+        assert!(mdb.recall("alice zzz qqq", 10, 0, &no_filters()).is_empty());
     }
 
     #[test]
@@ -638,16 +698,24 @@ mod tests {
             "東京タワー 旅行",
             "don't stop rock-n-roll",
             "Ünïcödé Plaza",
+            "two red houses",
+            "Mobility House GmbH, EV charging partner",
+            // FTS5 and Rust disagree on these
+            "mu\u{308}de cafe\u{301}s",
+            "\u{17f}treet Ǡbc københavn λόγος",
+            "abc\u{e000}def",
         ];
         for d in docs {
             mdb.insert_thing(d, None, None, None, 5, None, None, 5, None, &ts()).unwrap();
         }
 
-        // Every word, every reversed doc, plus hand-picked cross-field and miss cases
+        // Every word, every reversed doc, plus hand-picked word-form, partial and miss cases
         let mut queries: Vec<String> = vec![
             "saarbrucken research", "cafe resume", "resume cafe", "munchen strasse",
             "मरहब", "مرحبا", "رحب", "rock n roll", "don't", "unicode plaza", "plaza zzz",
-            "zzz", "alice zzz", "हिंदी zzz",
+            "zzz", "alice zzz", "alice zzz qqq", "हिंदी zzz", "house", "universities",
+            "the mobility house", "mobility house berlin zzz", "mude", "cafes", "street", "streets",
+            "s", "a", "abc", "abcdef", "kobenhavn", "λογοσ", "λογος", "ǡbc", "abc a zzz",
         ].into_iter().map(String::from).collect();
         for d in docs.iter().copied().chain(["Alice moved to Berlin last spring", "Marie Curie physicist"]) {
             let words: Vec<&str> = d.split_whitespace().collect();
@@ -684,11 +752,11 @@ mod tests {
         // A killed process never runs destructors
         std::mem::forget(a);
 
-        let (file_bloom, file_gen) = load_bloom(&tmp.bloom_path()).expect("bloom file written");
-        assert!(!should_skip_fts(&file_bloom, "plum"));
+        let file = load_bloom(&tmp.bloom_path()).expect("bloom file written");
+        assert!(!should_skip_fts(&file.bloom, "plum"));
 
         let b = tmp.open();
-        assert_eq!(file_gen, read_write_gen(b.conn()).unwrap(), "file is current, no rebuild needed");
+        assert_eq!(file.write_gen, read_write_gen(b.conn()).unwrap(), "file is current, no rebuild needed");
         assert!(!b.recall("plum", 10, 0, &no_filters()).is_empty());
     }
 
@@ -712,10 +780,118 @@ mod tests {
         tmp.open().insert_thing("quartz", None, None, None, 5, None, None, 5, None, &ts()).unwrap();
 
         // Pre-1.0.4 layout: raw bloom bytes, no header, missing "quartz"
-        std::fs::write(tmp.bloom_path(), new_bloom().to_bytes()).unwrap();
+        std::fs::write(tmp.bloom_path(), bloom_with(&[]).to_bytes()).unwrap();
 
         assert!(!tmp.open().recall("quartz", 10, 0, &no_filters()).is_empty());
         let data = std::fs::read(tmp.bloom_path()).unwrap();
         assert_eq!(&data[..8], BLOOM_MAGIC);
+    }
+
+    #[test]
+    fn test_version_1_bloom_file_rebuilt() {
+        let tmp = TempDb::new("v1-format");
+        tmp.open().insert_thing("quartz", None, None, None, 5, None, None, 5, None, &ts()).unwrap();
+
+        // A 2.1 file for the current write_gen, without the stems "quartzes" needs
+        let write_gen = read_write_gen(tmp.open().conn()).unwrap();
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(BLOOM_MAGIC);
+        v1.extend_from_slice(&1u32.to_le_bytes());
+        v1.extend_from_slice(&write_gen.to_le_bytes());
+        v1.extend_from_slice(&bloom_with(&[]).to_bytes());
+        std::fs::write(tmp.bloom_path(), v1).unwrap();
+
+        assert_eq!(tmp.open().recall("quartzes", 10, 0, &no_filters()).len(), 1);
+        let data = std::fs::read(tmp.bloom_path()).unwrap();
+        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), BLOOM_FORMAT_VERSION);
+    }
+
+    // --- sizing ---
+
+    /// Store `count` things of 100 distinct words each, from thing number `from`.
+    fn fill(mdb: &mut MemoryDb, from: usize, count: usize) {
+        for i in from..from + count {
+            let words: Vec<String> = (0..100).map(|j| format!("grow{}", i * 100 + j)).collect();
+            mdb.insert_thing(&words.join(" "), None, None, None, 5, None, None, 5, None, &ts()).unwrap();
+        }
+    }
+
+    /// Fill until the bloom outgrows MIN_CAPACITY; returns how many things it took.
+    fn fill_until_grown(mdb: &mut MemoryDb) -> usize {
+        let mut inserted = 0;
+        while mdb.state.borrow().capacity == MIN_CAPACITY {
+            assert!(inserted < 1000, "the bloom never grew");
+            fill(mdb, inserted, 1);
+            inserted += 1;
+        }
+        inserted
+    }
+
+    #[test]
+    fn test_bloom_sized_to_data() {
+        let tmp = TempDb::new("sized");
+        let mut a = tmp.open();
+        a.insert_thing("plum tart", None, None, None, 5, None, None, 5, None, &ts()).unwrap();
+        let state = a.state.borrow();
+        assert_eq!(state.capacity, MIN_CAPACITY);
+        assert!((2..10).contains(&state.keys), "{}", state.keys);
+        // ~48 KB for 20K keys at 0.01%, where version 1 always took 1.8 MB
+        let size = std::fs::metadata(tmp.bloom_path()).unwrap().len();
+        assert!(size < 64 * 1024, "{size}");
+    }
+
+    #[test]
+    fn test_bloom_grows_when_full() {
+        let mut mdb = test_mdb();
+        let inserted = fill_until_grown(&mut mdb);
+        let state = mdb.state.borrow();
+        // Rebuilt by the write that overfilled it, at twice the keys
+        assert!(state.keys > MIN_CAPACITY && state.capacity == 2 * state.keys,
+            "{} keys, capacity {}", state.keys, state.capacity);
+        drop(state);
+        let last = format!("grow{}", inserted * 100 - 1);
+        for q in ["grow0", last.as_str()] {
+            assert!(!skips(&mdb, q), "{q}");
+        }
+        assert!(skips(&mdb, "absentword"));
+    }
+
+    #[test]
+    fn test_grown_bloom_shared_across_processes() {
+        let tmp = TempDb::new("grown");
+        let mut a = tmp.open();
+        let b = tmp.open();
+        let inserted = fill_until_grown(&mut a);
+
+        // b catches up with a's writes: same size and key count, and it sees the newest words
+        let last = format!("grow{}", inserted * 100 - 1);
+        assert_eq!(b.recall(&last, 10, 0, &no_filters()).len(), 1);
+        let (a_state, b_state) = (a.state.borrow(), b.state.borrow());
+        assert_eq!((b_state.keys, b_state.capacity), (a_state.keys, a_state.capacity));
+        let file = load_bloom(&tmp.bloom_path()).unwrap();
+        assert_eq!((file.keys, file.capacity), (a_state.keys, a_state.capacity));
+    }
+
+    #[test]
+    fn test_key_count_survives_reopen() {
+        let tmp = TempDb::new("key-count");
+        let mut a = tmp.open();
+        fill(&mut a, 0, 3);
+        let keys = a.state.borrow().keys;
+        assert!(keys >= 600, "{keys}");
+        // Reopening loads the file's count rather than recounting
+        assert_eq!(tmp.open().state.borrow().keys, keys);
+    }
+
+    #[test]
+    fn test_rebuild_sizes_to_current_data() {
+        let mut mdb = test_mdb();
+        let inserted = fill_until_grown(&mut mdb);
+        for i in 1..=inserted {
+            mdb.forget(&format!("T{i}")).unwrap();
+        }
+        mdb.rebuild_bloom();
+        assert_eq!(mdb.state.borrow().capacity, MIN_CAPACITY, "shrinks back");
+        assert!(skips(&mdb, "grow0"), "forgotten words are gone after a rebuild");
     }
 }

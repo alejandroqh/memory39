@@ -1,6 +1,6 @@
 [package]
 name = "memory39"
-version = "2.1.0"
+version = "2.5.0"
 edition = "2024"
 description = "Single-binary, single-file, local memory shared by every MCP client."
 authors = ["Alejandro Quintanar"]
@@ -45,4 +45,5 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 turbomcp = "3.6"
 dirs = "6"
 bloomfilter = "3"
+rust-stemmers = "1"
 unicode-normalization = "0.1"

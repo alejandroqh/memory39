@@ -22,33 +22,34 @@ Results are ranked by temporal-priority scoring: **0.4 x relevance + 0.3 x impor
 
 ## Performance
 
-memory39 uses a **bloom filter** as a pre-check layer before FTS5 queries. On every `recall`, the bloom filter tests whether the query words exist anywhere in the database. If any of them definitely doesn't, no memory can match, so the FTS5 query is skipped entirely and zero results come back in **O(1)** without touching the full-text index.
+memory39 uses a **bloom filter** as a pre-check layer before FTS5 queries. On every `recall`, the bloom filter tests whether enough query words could exist anywhere in the database: the word itself for a one-word query, at least half the words otherwise (the same rule recall uses, see [How recall matches](#how-recall-matches)). If not, no memory can match, so FTS5 is skipped entirely and zero results come back in **O(1)** without touching the full-text index.
 
 | Layer | When it runs | Cost |
 |-------|-------------|------|
-| Bloom filter | Every `recall` query | ~1-2 us: one cached freshness read + hash probes |
+| Bloom filter | Every `recall` query | ~2-4 us: one cached freshness read, stemming, hash probes |
 | FTS5 search | Only if bloom says "maybe" | Full-text index scan |
 
 How it works:
 
-- **Word-level, order-free** - every indexed memory field is tokenized into words stored in the bloom filter. FTS5 matches query words in any order and in any field, so the bloom filter does too: `"alice berlin"` is skipped only if `alice` or `berlin` appears in no memory at all.
-- **Unicode-normalized** - tokens are lowercased with diacritics removed (matching FTS5's `unicode61 remove_diacritics 2`), so `café` and `cafe` hit the same entry.
-- **Prefix-safe** - long words (>6 chars) that FTS5 would prefix-expand never decide a skip, avoiding false negatives.
+- **FTS5's own terms** - the bloom filter holds exactly the terms the FTS5 index holds: built from the index vocabulary, and on every write from the new text run through a scratch FTS5 table with the same tokenizer. Folding quirks (`ſ` becomes `s`, decomposed accents stay inside one word) can't make it disagree with the index.
+- **Word-form aware** - every term's Snowball stems (English, Spanish, German) are stored too, so `cars` is a "maybe" when only `car` is stored, just as recall would match it.
+- **Order-free, partial-match aware** - FTS5 matches words in any order and in any field, and recall returns memories with at least half the words, so `alice zzz` still runs FTS5 when `alice` exists. `alice zzz qqq` is skipped.
+- **Decides only where it is exact** - a query word decides a skip only if every character is ASCII or a Latin letter with one accent (`é`, `ü`, `ñ`, `ç`), where memory39's tokenizer is verified to match FTS5's character by character (an exhaustive unit test). Other words (`straße`, Greek, CJK) always count as "maybe".
 - **Persisted and always fresh** - the bloom filter is saved to `<db>.bloom` on every new memory (not on exit, so a killed MCP server loses nothing) and loaded on startup. SQLite triggers keep a write counter that counts every insert and update from any process: other MCP clients, the CLI, even older memory39 versions. The file records the counter value it was built for and every `recall` checks it, so a stale bloom filter is reloaded or rebuilt automatically instead of hiding new memories.
-- **Zero false negatives** - if a word exists in any memory, the bloom filter always says "maybe". It can only produce false positives (saying "maybe" when nothing matches), which just fall through to FTS5 as usual.
-
-Configured for 600K items at 0.001% false positive rate.
+- **Zero false negatives** - if a memory could match, the bloom filter always says "maybe". It can only produce false positives (saying "maybe" when nothing matches), which just fall through to FTS5 as usual.
+- **Sized to the data** - each build holds twice the keys it starts with (at least 20K) at a 0.01% false-positive rate, using the standard sizing `m = -n ln(p) / (ln 2)²` bits and `k = -log2(p)` hashes. The file header counts keys as writes add them, and the write that fills the filter rebuilds it at double size. A database with a few hundred memories keeps a ~48 KB file, so saving it on every write and reloading it in other processes stay cheap (~0.3 ms and ~10-25 us).
 
 ### Measured cost
 
-Numbers from `cargo run --release --example bloom_bench` on a synthetic DB (~300 memories):
+Numbers from `cargo run --release --example bloom_bench` on a synthetic DB (~700 memories):
 
 | Query | Path | Avg per call | Throughput |
 |-------|------|-------------:|-----------:|
-| Unknown fact | Bloom says "no match possible"; FTS5 skipped | **~1.7 us** | ~590K ops/sec |
-| Known fact | Bloom says "maybe" -> FTS5 search runs | ~300 us | ~3.4K ops/sec |
+| Unknown fact, one word | Bloom says "no match possible"; FTS5 skipped | **~2.5 us** | ~390K ops/sec |
+| Unknown fact, two long words | Same | ~4 us | ~250K ops/sec |
+| Known fact | Bloom says "maybe" -> FTS5 search runs | ~210 us | ~4.8K ops/sec |
 
-Negative queries are **~175x faster** than positive ones. Most of the negative-path cost is the freshness check (a single-row read of the write counter, served from SQLite's page cache); the bloom probes themselves take ~150 ns.
+Negative queries are **~80x faster** than positive ones. The negative path is the freshness check (a single-row read of the write counter, served from SQLite's page cache), stemming each word in three languages, and the bloom probes.
 
 ## Install
 
@@ -173,7 +174,7 @@ memory39 recall "*"  # list all
 
 | Arg/Flag | Required | Description |
 |----------|----------|-------------|
-| `<query>` | yes | Search keywords; every word must match, so use a few distinctive words rather than a sentence. `OR` matches any (`budget OR savings`). FTS5 syntax supported; `*` = all |
+| `<query>` | yes | Search keywords; a few distinctive words work better than a sentence. Memories with every word come first, then those with at least half of them; word forms match too (see [How recall matches](#how-recall-matches)). FTS5 syntax (`budget OR savings`, `"exact phrase"`, `prefix*`) runs as written; `*` = all |
 | `-l`, `--limit` | no | Max results (default 10) |
 | `--min` | no | Minimum importance 0-10 |
 | `--from` | no | Date start `YYYY-MM-DD` (events only) |
@@ -282,9 +283,32 @@ Results from `recall` are ranked by composite score:
 
 | Component | Weight | Description |
 |-----------|--------|-------------|
-| Relevance | 0.4 | FTS5 match quality |
+| Relevance | 0.4 | FTS5 match quality (bm25), mapped to 0-1 |
 | Importance | 0.3 | Memory importance (0-10) |
 | Recency | 0.3 | Exponential decay, 30-day half-life |
+
+Each FTS table contributes its best bm25 matches (4 per result requested) before the composite score reorders them. Partial matches (see below) are listed after full matches, ordered by how many words they match, and their score is scaled by the fraction of words matched.
+
+### How recall matches
+
+A plain-words query runs in tiers. Each tier only fills the slots the previous ones left:
+
+1. **Every word, as typed.** Words are passed to FTS5 quoted, so punctuation is tokenized rather than parsed: `Alice's`, `e-mail` and `v2.1` work. FTS5 operators are case-sensitive, so `salt and pepper` is three plain words.
+2. **Every word, as typed or as a word form.** For each word, memory39 looks in FTS5's own vocabulary (`fts5vocab`) for indexed terms with the same Snowball stem in English, Spanish or German: `house`/`houses`, `running`/`run`, `hablando`/`hablar`, `desarrollando`/`desarrollo`. Words that only share their first letters don't match (`transportation`/`transparent`).
+3. **At least half the words.** `the mobility house` still finds "Mobility House GmbH". These matches are ordered by how many words they contain, then by relevance, so a memory matching only common words doesn't win on importance.
+
+A query containing FTS5 syntax (`"`, `*`, `(`, `)`, `:`, or ` AND `/` OR `/` NOT `) runs exactly as written, without these tiers. Use it for synonyms and irregular forms that no stemmer catches: `child OR children`.
+
+### Writing queries
+
+Send only the distinctive words: `kubecon talk`, not `what is the kubecon talk about?`. Common words like `what`, `is` and `the` appear in many memories, which hurts recall in two ways:
+
+- **Noise.** In the at-least-half tier, `what`, `is` and `the` are 3 of the 6 words in `what is the kubecon talk about?`, so "what is the wifi password at home" comes back next to the KubeCon memory.
+- **Speed.** That tier ranks every memory containing any query word. A word found in thousands of memories costs milliseconds on large databases, while `kubecon talk` ranks only the memories that contain those words.
+
+Most agents follow the `recall` tool description, which asks for a few distinctive keywords. Smaller models and scripts often pass the user's question through unchanged.
+
+For agent builders, a fast decision model in front of memory39 works better than relying on the main LLM for this. It can pick the distinctive words of the user's question before `recall`, decide whether a question needs memory at all, and score which recalled memories are relevant before they reach the context. One example is [Jev](https://docs.typesafe.ai/concepts/system-one) from TypeSafe AI, a "System One" decision model. It returns typed answers (a choice from a set, a score, or a yes/no probability) with calibrated confidence instead of generated text.
 
 ### Memory IDs
 

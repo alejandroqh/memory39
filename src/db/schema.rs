@@ -73,44 +73,16 @@ pub(crate) fn migrate_things_fts_drop_related(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub(crate) const PREFIX_MIN_LEN: usize = 6;
+/// The tokenizer of every FTS table in SCHEMA. Anything that must tokenize exactly like
+/// the index (the bloom filter's term extraction) uses this.
+pub(crate) const FTS_TOKENIZER: &str = "unicode61 remove_diacritics 2";
 
-/// Expand a query for prefix matching: truncate words > min_len chars and add '*'.
-/// Returns None if query uses FTS5 operators or no words were expanded.
-/// Check if haystack contains needle case-insensitively without allocating.
-fn contains_ci(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
-}
-
+/// Whether the query is written in FTS5 syntax (phrases, prefixes, groups, column filters,
+/// operators). FTS5 operators are case-sensitive, so "salt and pepper" is plain words.
+/// NEAR always comes with parentheses, so it needs no check of its own.
 pub(crate) fn has_fts5_operators(query: &str) -> bool {
-    if query.contains('"') || query.contains('*') || query.contains('(')
-        || query.contains(')') || query.contains(':')
-    {
-        return true;
-    }
-    let bytes = query.as_bytes();
-    contains_ci(bytes, b" AND ") || contains_ci(bytes, b" OR ") || contains_ci(bytes, b" NOT ")
-        || contains_ci(bytes, b"NEAR")
-}
-
-pub(crate) fn expand_query_for_prefix(query: &str) -> Option<String> {
-    if has_fts5_operators(query) {
-        return None;
-    }
-
-    let mut result = String::with_capacity(query.len() + 8);
-    let mut has_prefix = false;
-    for word in query.split_whitespace() {
-        if !result.is_empty() { result.push(' '); }
-        if word.chars().count() > PREFIX_MIN_LEN {
-            result.extend(word.chars().take(PREFIX_MIN_LEN));
-            result.push('*');
-            has_prefix = true;
-        } else {
-            result.push_str(word);
-        }
-    }
-    if has_prefix { Some(result) } else { None }
+    query.contains(['"', '*', '(', ')', ':'])
+        || query.contains(" AND ") || query.contains(" OR ") || query.contains(" NOT ")
 }
 
 pub(crate) const SCHEMA: &str = "
@@ -331,4 +303,12 @@ CREATE TRIGGER IF NOT EXISTS persons_gen_ai AFTER INSERT ON persons BEGIN UPDATE
 CREATE TRIGGER IF NOT EXISTS persons_gen_au AFTER UPDATE ON persons BEGIN UPDATE write_gen SET n = n + 1 WHERE id = 1; END;
 CREATE TRIGGER IF NOT EXISTS places_gen_ai AFTER INSERT ON places BEGIN UPDATE write_gen SET n = n + 1 WHERE id = 1; END;
 CREATE TRIGGER IF NOT EXISTS places_gen_au AFTER UPDATE ON places BEGIN UPDATE write_gen SET n = n + 1 WHERE id = 1; END;
+
+-- Indexed terms of each FTS table, read to find word forms of query words.
+-- Per-connection views over the live index: nothing is stored.
+CREATE VIRTUAL TABLE IF NOT EXISTS temp.events_fts_vocab USING fts5vocab(main, events_fts, row);
+CREATE VIRTUAL TABLE IF NOT EXISTS temp.events_undated_fts_vocab USING fts5vocab(main, events_undated_fts, row);
+CREATE VIRTUAL TABLE IF NOT EXISTS temp.things_fts_vocab USING fts5vocab(main, things_fts, row);
+CREATE VIRTUAL TABLE IF NOT EXISTS temp.persons_fts_vocab USING fts5vocab(main, persons_fts, row);
+CREATE VIRTUAL TABLE IF NOT EXISTS temp.places_fts_vocab USING fts5vocab(main, places_fts, row);
 ";

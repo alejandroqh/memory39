@@ -6,7 +6,7 @@ Usage: cargo run --release --example bloom_bench -- <known-fact> <unknown-fact> 
 
   <known-fact>     A query string that matches at least one memory in the DB.
                    Exercises the FTS5 path (bloom says \"maybe\" -> search runs).
-  <unknown-fact>   A short query (1 word, <=6 chars) that is NOT present anywhere.
+  <unknown-fact>   A query whose words (and their word forms) appear in no memory.
                    Exercises the bloom-filter fast path (no disk I/O).
   [db-path]        Optional. Defaults to ~/.memory39/memory39.db.
 

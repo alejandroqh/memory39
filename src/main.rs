@@ -194,7 +194,7 @@ enum Command {
     },
     /// Search across all memories
     Recall {
-        /// Search keywords. Every word must match; use OR to match any ("budget OR savings"). "*" lists all
+        /// Search keywords. Memories with every word come first, then with most of them; word forms match too (house/houses). FTS5 syntax ("budget OR savings", "exact phrase", prefix*) runs as written. "*" lists all
         query: String,
         /// Max results to return
         #[arg(short, long, default_value = "10")]

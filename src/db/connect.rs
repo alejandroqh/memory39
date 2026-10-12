@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use super::crud::memory_id;
-use super::schema::expand_query_for_prefix;
+use super::query::QueryPlan;
 
 const LINKABLE_FIELDS: &[&str] = &["tags", "emotion", "location", "people", "related"];
 pub const DEFAULT_CONNECT_LIMIT: usize = 30;
@@ -48,24 +48,19 @@ pub fn find_connections(
     let mut connections: Vec<Connection_> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
-    // Phase 1: Direct - FTS5 AND query (exact then prefix fallback)
-    let and_query = concepts.iter()
-        .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-
-    phase_direct(conn, &and_query, min_importance, &mut connections, &mut seen);
-
-    if connections.is_empty() {
-        // Prefix fallback for direct phase
-        let prefix_and = concepts.iter()
-            .filter_map(|c| expand_query_for_prefix(c))
-            .collect::<Vec<_>>();
-        if prefix_and.len() == concepts.len() {
-            let and_expanded = prefix_and.join(" AND ");
-            phase_direct(conn, &and_expanded, min_importance, &mut connections, &mut seen);
-        }
+    // Each concept matches memories holding all its words, as typed or as word forms
+    let concept_queries: Vec<String> = concepts.iter()
+        .map(|c| QueryPlan::new(conn, c))
+        .filter(|plan| !plan.is_empty())
+        .map(|plan| format!("({})", plan.all_words()))
+        .collect();
+    // A concept with no searchable word (only punctuation) connects to nothing
+    if concept_queries.len() < concepts.len() {
+        return ConnectionResult { connections, elapsed_ms: start.elapsed().as_millis() };
     }
+
+    // Phase 1: Direct - all concepts in one memory
+    phase_direct(conn, &concept_queries.join(" AND "), min_importance, &mut connections, &mut seen);
 
     if connections.len() >= limit || start.elapsed() >= timeout {
         connections.truncate(limit);
@@ -74,17 +69,8 @@ pub fn find_connections(
 
     // Phase 2: Shared attributes - search each concept, cross-match fields
     let mut concept_rows: Vec<Vec<MemRow>> = Vec::new();
-    for concept in concepts {
-        let escaped = format!("\"{}\"", concept.replace('"', "\"\""));
-        let mut rows = search_mem_rows(conn, &escaped, min_importance);
-        // Prefix fallback if exact match found few rows
-        if rows.len() < 5
-            && let Some(expanded) = expand_query_for_prefix(concept) {
-                let seen_mids: HashSet<String> = rows.iter().map(|r| r.mid.clone()).collect();
-                let extra = search_mem_rows(conn, &expanded, min_importance);
-                rows.extend(extra.into_iter().filter(|r| !seen_mids.contains(&r.mid)));
-            }
-        concept_rows.push(rows);
+    for query in &concept_queries {
+        concept_rows.push(search_mem_rows(conn, query, min_importance));
 
         if start.elapsed() >= timeout {
             return ConnectionResult { connections, elapsed_ms: start.elapsed().as_millis() };
